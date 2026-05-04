@@ -1,17 +1,17 @@
-# findGEVE: Tool for Giant Endogenous Viral Elements (GEVEs) identification in eukaryotic genome assemblies
+# findGEVE: GEVE identification tool in eukaryotic genome assemblies
 ![Python Version](https://img.shields.io/badge/python-3.8+-blue.svg)
 ![MIT license](https://img.shields.io/badge/License-MIT-Blue.svg)
 
-Many GEVE genomes from Nucleocytoplasmic Large DNA Viruses (NCLDVs) have been known to be integrated into various eukaryotic genomes. Various bioinformatics tools have been developed to identify GEVEs in genome assemblies, such as [Viralrecall](https://github.com/faylward/viralrecall), [genomAD](https://github.com/apcamargo/genomad/), and [VirSorter2](https://github.com/jiarong/VirSorter2). However, these tools lack GEVE boundary detection methods (TIR & TSD), and their output still requires many processing steps before it is suitable for downstream analysis. 
+Many Giant Endogenous Viral Elements (GEVEs) genomes from Nucleocytoplasmic Large DNA Viruses (NCLDVs) have been known to be integrated into various eukaryotic genomes. Various bioinformatics tools have been developed to identify GEVEs in genome assemblies, such as [Viralrecall](https://github.com/faylward/viralrecall), [genomAD](https://github.com/apcamargo/genomad/), and [VirSorter2](https://github.com/jiarong/VirSorter2). However, these tools lack GEVE boundary detection methods (TIR & TSD), and their output still requires many processing steps before it is suitable for downstream analysis. 
 
 Here, I present **findGEVE** for end-to-end GEVE identification, with output ready for downstream analysis.
 
 **More detail about this script:**
 - Inspired by Viralrecall, with many improvements for more robust GEVE identification.
-- Fully written in Python, with only one external dependency: BLAST+.
+- Fully written in Python, with only one external dependency, which is BLAST+.
 - Uses three different HMM databases: NCLDV hallmark, GVOG, and Pfam v38.
 - Features automated TIR and TSD identification based on the flanking regions of each candidate GEVE.
-- Produces output files suitable for downstream analysis.
+- Produces output files suitable for downstream analysis, such as phylogenetic tree.
 
 ## Table of Contents
 - [1. Requirements](#1-requirements)
@@ -136,7 +136,7 @@ Retained GEVE are sorted by contig and position, assigned IDs, and store to outp
 ├── Chlamydomonas.geve.gff      # Annotated GEVE relative to host genome
 ├── Chlamydomonas.geve.cds      # Coding sequence for each retained GEVE
 ├── Chlamydomonas.geve.pep      # Protein sequence for each retained GEVE
-└── hallmark/  # Per-hallmark type protein sequence (suitable for phylogenetic)
+└── hallmark/  			# Per-hallmark type protein sequence (suitable for phylogenetic)
 	├── Chlamydomonas.d5.pep  
 	├── Chlamydomonas.rnapl.pep  
 	├── Chlamydomonas.polb.pep  
@@ -237,9 +237,9 @@ Dede Kurniawan
 - Linkedin: [https://www.linkedin.com/in/dede-kurniawann/](https://www.linkedin.com/in/dede-kurniawann/)
 - E-mail: [dedekurniawan@genomics.cn](mailto:dedekurniawan@genomics.cn) or [dedearkun2710@gmail.com](mailto:dedearkun2710@gmail.com)
 ## 6. Citation
-No prior publication yet for this tool. If you use this tool in your research, please cite the repository now.
+No prior publication yet for this tool. If you use this tool in your research, please cite the repository for now.
 
-> Kurniawan, D. 2016. findGEVE: Tool for Giant Endogenous Viral Elements (GEVEs) identification in eukaryotic genome assemblies. https://github.com/dedee95/findGEVE
+> Kurniawan, D. 2026. findGEVE: GEVE identification tool in eukaryotic genome assemblies. https://github.com/dedee95/findGEVE
 
 ## 7. Acknowledgment
-hanks to [Dr. Frank Aylward](https://scholar.google.com/citations?user=JLV6g2AAAAAJ&hl=en) who made viralrecall version 1 and curated the hallmark HMM database. This tool Inspired by Viralrecall. 
+Big thanks to [Dr. Frank Aylward](https://scholar.google.com/citations?user=JLV6g2AAAAAJ&hl=en) who made viralrecall version 1 and curated the hallmark HMM database. This tool Inspired by Viralrecall. 
