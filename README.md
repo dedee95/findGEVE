@@ -70,7 +70,7 @@ Pfam-A.hmm         # optional (better provide it)
 
 1. The NCLDV_markers.hmm file is already available in this repository at `database/NCLDV_markers.hmm`. Many thanks to [Dr. Frank Aylward](https://scholar.google.com/citations?user=JLV6g2AAAAAJ&hl=en) and his team, who created this database and make it open souce. 
 2. The Giant Virus Orthologous Groups (GVOG) database can be downloaded from its [official website](https://faylward.github.io/GVDB/). Make sure to download the `.hmm` file and rename it to `gvog.hmm`. 
-3. The latest version of the Pfam database can be downloaded from [EMBL-EBI](https://www.ebi.ac.uk/interpro/download/pfam/](https://www.ebi.ac.uk/interpro/download/pfam/) 
+3. The latest version of the Pfam database can be downloaded from [EMBL-EBI](https://www.ebi.ac.uk/interpro/download/pfam/) 
 
 Alternatively, you can use this command to download GVOG and Pfam database:
 ```
