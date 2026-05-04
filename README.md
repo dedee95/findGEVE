@@ -159,7 +159,7 @@ This tool has six main steps for robust GEVE identification. It can be used on c
 6. **TSD identification** for candidate GEVEs where TIRs are detected.
 ### 4.1 ORF/Gene prediction
 The genome FASTA is indexed with `pyfastx`. Every contig shorter than `min_contig` (default 50 kb) is discarded. Each surviving contig is dispatched to a worker process running `pyrodigal` in `meta=True` mode. pyrodigal metagenomic mode is being used because it does not assume a single genetic code or codon-usage profile and is appropriate for hunting integrated viral genes inside a host background. 
-![[docs/1.gene_prediction.png]]
+![prokaryotic gene prediction](docs/1.gene_prediction.png)
 ### 4.2 HMM annotation
 Three sequential `pyhmmer` scans with same E-value cutoff (`evalue`, default **1e-5**), narrowing the search space at each step. List of hallmark genes: *A32, D5, SFII, mcp, mRNAc, PolB, RNAPL, RNAPS, RNR, VLTF3*.
 ![[docs/2.hmm_annotation.png]]
