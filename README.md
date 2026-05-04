@@ -10,19 +10,26 @@ Here, I present **findGEVE** for end-to-end GEVE identification, with output rea
 - Features automated TIR and TSD identification based on the flanking regions of each candidate GEVE.
 - Produces output files suitable for downstream analysis.
 
-- [[#1. Requirements|1. Requirements]]
-	- [[#1. Requirements#1.1 Third party Python packages:|1.1 Third party Python packages:]]
-	- [[#1. Requirements#1.2 External Python packages:|1.2 External Python packages:]]
-	- [[#1. Requirements#1.3 HMM database|1.3 HMM database]]
-- [[#2. Installation|2. Installation]]
-- [[#3. Quick usage guide|3. Quick usage guide]]
-	- [[#3. Quick usage guide#3.1 Run with test data|3.1 Run with test data]]
-	- [[#3. Quick usage guide#3.2 Output files|3.2 Output files]]
-- [[#4. findGEVE algorithm detail|4. findGEVE algorithm detail]]
-	- [[#4. findGEVE algorithm detail#4.1|4.1]]
-- [[#5. Author|5. Author]]
-- [[#6. Citation|6. Citation]]
-- [[#7. Acknowledgment|7. Acknowledgment]]
+## Table of Contents
+- [1. Requirements](#1-requirements)
+  - [1.1 Third party Python packages](#11-third-party-python-packages)
+  - [1.2 External Python packages](#12-external-python-packages)
+  - [1.3 HMM database](#13-hmm-database)
+- [2. Installation](#2-installation)
+- [3. Quick usage guide](#3-quick-usage-guide)
+  - [3.1 Run with test data](#31-run-with-test-data)
+  - [3.2 Output files](#32-output-files)
+- [4. findGEVE algorithm detail](#4-findgeve-algorithm-detail)
+  - [4.1 ORF/Gene prediction](#41-orfgene-prediction)
+  - [4.2 HMM annotation](#42-hmm-annotation)
+  - [4.3 Seed candidate GEVE via hallmark clustering](#43-seed-candidate-geve-via-hallmark-clustering)
+  - [4.4 Rolling viral score calculation](#44-rolling-viral-score-calculation)
+  - [4.5 Per-cluster boundary refinement](#45-per-cluster-boundary-refinement)
+    - [4.5.1 TIR detection algorithm](#451-tir-detection-algorithm)
+  - [4.6 TSD identification algorithm](#46-tsd-identification-algorithm)
+- [5. Author](#5-author)
+- [6. Citation](#6-citation)
+- [7. Acknowledgment](#7-acknowledgment)
 
 ---
 ## 1. Requirements
@@ -206,6 +213,7 @@ A TIR candidate must pass four criteria:
 | `len`     | 10 bp ≤ tir_length ≤ 10,000 bp                         |
 | `id`      | tir_identity ≥ 65 %                                    |
 | `bracket` | encloses ≥ ⌈0.5 × total_hallmarks⌉ hallmark ORFs (≥ 1) |
+
 The bracket test is the biological keystone: *a real GEVE TIR brackets the viral content*. Inverted repeats that miss the hallmarks are accepted as viral-region neighbors, not as the integration's boundaries.
 ### 4.6 TSD identification algorithm
 Many GEVE duplicate a short host sequence (TSD) on both flanks of the insertion. So, if TIR pair were found, then check the target site duplication (TSD) in TIR flank region.
