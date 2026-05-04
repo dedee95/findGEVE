@@ -2,7 +2,7 @@
 ![Python Version](https://img.shields.io/badge/python-3.8+-blue.svg)
 ![MIT license](https://img.shields.io/badge/License-MIT-Blue.svg)
 
-Many GEVE genomes from Nucleocytoplasmic Large DNA Viruses (NCLDVs) have been known to be integrated into various eukaryotic genomes. Various bioinformatics tools have been developed to identify GEVEs in genome assemblies, such as [Viralrecall]()https://github.com/faylward/viralrecall, [genomAD](https://github.com/apcamargo/genomad/), and [VirSorter2](https://github.com/jiarong/VirSorter2). However, these tools lack GEVE boundary detection methods (TIR & TSD), and their output still requires many processing steps before it is suitable for downstream analysis. 
+Many GEVE genomes from Nucleocytoplasmic Large DNA Viruses (NCLDVs) have been known to be integrated into various eukaryotic genomes. Various bioinformatics tools have been developed to identify GEVEs in genome assemblies, such as [Viralrecall](https://github.com/faylward/viralrecall), [genomAD](https://github.com/apcamargo/genomad/), and [VirSorter2](https://github.com/jiarong/VirSorter2). However, these tools lack GEVE boundary detection methods (TIR & TSD), and their output still requires many processing steps before it is suitable for downstream analysis. 
 
 Here, I present **findGEVE** for end-to-end GEVE identification, with output ready for downstream analysis.
 
