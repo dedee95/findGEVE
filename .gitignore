@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.fai
+*.fxi
+Result_*/
+*.tmp
+.DS_Store
