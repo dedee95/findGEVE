@@ -162,24 +162,24 @@ The genome FASTA is indexed with `pyfastx`. Every contig shorter than `min_conti
 ![prokaryotic gene prediction](docs/1.gene_prediction.png)
 ### 4.2 HMM annotation
 Three sequential `pyhmmer` scans with same E-value cutoff (`evalue`, default **1e-5**), narrowing the search space at each step. List of hallmark genes: *A32, D5, SFII, mcp, mRNAc, PolB, RNAPL, RNAPS, RNR, VLTF3*.
-![[docs/2.hmm_annotation.png]]
+![HMM annotation](docs/2.hmm_annotation.png)
 ### 4.3 Seed candidate GEVE via hallmark clustering
 Finds genomic regions containing multiple distinct viral hallmark types within a sliding window. By default it slides a `300 kb` window over hallmark genes and require `≥2` distinct hallmark types.
 
 **For each contig with hallmark hits**
-![[docs/3.seed_candidate_1.png]]
+![Seed candidate GEVE 1](docs/3.seed_candidate_1.png)
 **Merging process**
 Many anchors produce overlapping windows. Any two clusters on the same contig whose spans overlap are merge together. After this pass, every cluster on a contig is non-overlapping. If there any two adjacent clusters it will be merge if their inter-cluster gap is `≤ 100 kb` and the merged span would not exceed `2 mb`.
 
 Example case for two cluster in the same contig are merged: 
-![[docs/3.seed_candidate_2.png]]
+![Seed candidate GEVE 2](docs/3.seed_candidate_2.png)
 
 Example case for two cluster in the same contig are NOT merged: 
-![[docs/3.seed_candidate_3.png]]
+![Seed candidate GEVE](docs/3.seed_candidate_3.png)
 ### 4.4 Rolling viral score calculation
 Computes a viral enrichment score per candidate contig using `net_score = virbit - pfambit` to retain high confident viral region.
 
-![[docs/4.viral_score.png]]
+![Viral score](docs/4.viral_score.png)
 
 **More detail about viral score**
 - **Giant Virus Orthologous Groups** (GVOG) database covering most NCLDV-encoded functions.
@@ -194,20 +194,20 @@ Viral score calculated by subtracting virbut (GVOG) with pfambit (PFAM). Viral r
 >*“So, a strong Pfam hit on an ORF without a strong viral hit suggests the protein (ORF) is part of the host, not the integrated viral element.”*
 
 Viral score in this tool also be used to determine cluster candidate GEVE boundary before go to TIR identification step.
-![[docs/4.viral_score_2.png]]
+![Rolling viral score](docs/4.viral_score_2.png)
 ### 4.5 Per-cluster boundary refinement 
 Each cluster candidate GEVE is processed end-to-end for TIR identification to retain it robust region. If no valid TIR is found, boundaries are retained from the viral-score evidence.
 
-![[docs/5.geve_boundary.png]]
+![GEVE boundary refinment](docs/5.geve_boundary.png)
 #### 4.5.1 TIR detection algorithm
 Many integrated NCLDVs retain Terminal Inverted Repeats (TIRs) at both ends of the integrant in opposite orientations. They are the structural signature of integration and the strongest evidence that a region is a coherent unit, NOT an artifact of clustering. 
 
 TIR identification conduction by using `blastn` self-vs-self forward with reverse-complement strand on the cluster candidate GEVE ± flanking. 
 
-![[docs/5.TIR_identification_1.png]]
+![TIR identification 1](docs/5.TIR_identification_1.png)
 Actually, we don't know how big the GEVE is yet, so we don't know how wide a window to `blastn`. `findGEVE.py` tries growing windows (a "flank ladder") to find a TIR sequence:
 
-![[docs/5.TIR_identification_2.png]]
+![TIR identification 2](docs/5.TIR_identification_2.png)
 A TIR candidate must pass four criteria:
 
 | Criteria  | Default thresholds                                     |
@@ -221,15 +221,15 @@ The bracket test is the biological keystone: *a real GEVE TIR brackets the viral
 ### 4.6 TSD identification algorithm
 Many GEVE duplicate a short host sequence (TSD) on both flanks of the insertion. So, if TIR pair were found, then check the target site duplication (TSD) in TIR flank region.
 
-![[docs/6.TSD_detection.png]]
+![TSD detection](docs/6.TSD_detection.png)
 
 The detector scans `tsd_search_window = 60 bp` on each flank for a k-mer match where `k ∈ [tsd_min, tsd_max] = [4, 12]`, preferring the longest match. Mismatches and slide tolerance scale with k:
 
-| k     | max mismatches | rationale                                             |
-| ----- | -------------- | ----------------------------------------------------- |
-| ≤ 5   | 0              | short TSDs must be perfect to be credible             |
-| 6–8   | 1              | mid-length TSDs tolerate one mismatch                 |
-| ≥ 9   | 2              | long TSDs may carry mutations from age of integration |
+| k     | max miss | rationale                                             |
+| ----- | -------- | ----------------------------------------------------- |
+| ≤ 5   | 0        | short TSDs must be perfect to be credible             |
+| 6–8   | 1        | mid-length TSDs tolerate one mismatch                 |
+| ≥ 9   | 2        | long TSDs may carry mutations from age of integration |
 
 Up to `tsd_max_slide = 2 bp` of positional offset is allowed on each side to absorb ±1–2 bp errors in the TIR boundary call. TSDs are only attempted when a TIR was found; without a defined boundary there is nothing to flank.
 ## 5. Author
