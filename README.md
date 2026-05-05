@@ -15,7 +15,7 @@ Here, I present **findGEVE** for end-to-end GEVE identification, with output rea
 - Features automated TIR and TSD identification based on the flanking regions of each candidate GEVE.
 - Produces output files suitable for downstream analysis, such as phylogenetic tree.
 
-> You can also read findGEVE introduction PPT ![here](docs/findGEVE_introduction.pdf)
+> You can also read findGEVE introduction PPT [here](docs/findGEVE_introduction.pdf)
 
 ## Table of Contents
 - [1. Requirements](#1-requirements)
