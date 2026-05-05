@@ -49,10 +49,10 @@ This tool is fully written in Python and mostly uses third-party Python packages
 - `pyrodigal`
 
 ```
-# install using pip
+# install using pip (RECOMENDED)
 pip install numpy pandas pyfastx pyhmmer pyrodigal
 
-# install using conda
+# or install using conda
 conda install -c conda-forge -c bioconda numpy pandas pyfastx pyhmmer pyrodigal
 ```
 ### 1.2 External Python packages:
@@ -140,7 +140,7 @@ Retained GEVE are sorted by contig and position, assigned IDs, and store to outp
 ├── Chlamydomonas.geve.gff      # Annotated GEVE relative to host genome
 ├── Chlamydomonas.geve.cds      # Coding sequence for each retained GEVE
 ├── Chlamydomonas.geve.pep      # Protein sequence for each retained GEVE
-└── hallmark/  			# Per-hallmark type protein sequence (suitable for phylogenetic)
+└── hallmark/                   # Per-hallmark type protein sequence (suitable for phylogenetic)
 	├── Chlamydomonas.d5.pep  
 	├── Chlamydomonas.rnapl.pep  
 	├── Chlamydomonas.polb.pep  
@@ -152,7 +152,7 @@ Retained GEVE are sorted by contig and position, assigned IDs, and store to outp
 	└── Chlamydomonas.vltf3.pep
 ```
 
-A predicted GEVE candidate is supported by the presence of multiple NCLDV-like hallmark genes. The presence of TIR and TSD also provide additional structural evidence. However,  candidates GEVE can still be reported without TIRs then it wilk use viral-score to determine it's boundary.
+A predicted GEVE candidate is supported by the presence of multiple NCLDV-like hallmark genes. The presence of TIR and TSD also provide additional structural evidence. However,  candidates GEVE can still be reported without TIRs then it will use viral-score to determine it's boundary.
 ## 4. findGEVE algorithm detail
 This tool has six main steps for robust GEVE identification. It can be used on contig- or chromosome-level genome assemblies.
 1. **ORF/gene prediction** using Pyrodigal (ignoring contigs ≤ 50 kb).
@@ -173,6 +173,7 @@ Finds genomic regions containing multiple distinct viral hallmark types within a
 **For each contig with hallmark hits**
 ![Seed candidate GEVE 1](docs/3.seed_candidate_1.png)
 **Merging process**
+
 Many anchors produce overlapping windows. Any two clusters on the same contig whose spans overlap are merge together. After this pass, every cluster on a contig is non-overlapping. If there any two adjacent clusters it will be merge if their inter-cluster gap is `≤ 100 kb` and the merged span would not exceed `2 mb`.
 
 Example case for two cluster in the same contig are merged: 
