@@ -240,7 +240,7 @@ Up to `tsd_max_slide = 2 bp` of positional offset is allowed on each side to abs
 ## 5. Author
 Dede Kurniawan
 - Linkedin: [https://www.linkedin.com/in/dede-kurniawann/](https://www.linkedin.com/in/dede-kurniawann/)
-- E-mail: [dedekurniawan@genomics.cn](mailto:dedekurniawan@genomics.cn) or [dedearkun2710@gmail.com](mailto:dedearkun2710@gmail.com)
+- E-mail: [dedekurniawan@genomics.cn](mailto:dedekurniawan@genomics.cn)
 ## 6. Citation
 No prior publication yet for this tool. If you use this tool in your research, please cite the repository for now.
 
