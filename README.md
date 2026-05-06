@@ -46,14 +46,14 @@ This tool is fully written in Python and mostly uses third-party Python packages
 - `pandas`
 - `pyfastx`
 - `pyhmmer`
-- `pyrodigal`
+- `pyrodigal-gv`
 
 ```
 # install using pip (RECOMENDED)
-pip install numpy pandas pyfastx pyhmmer pyrodigal
+pip install numpy pandas pyfastx pyhmmer pyrodigal-gv
 
 # or install using conda
-conda install -c conda-forge -c bioconda numpy pandas pyfastx pyhmmer pyrodigal
+conda install -c conda-forge -c bioconda numpy pandas pyfastx pyhmmer pyrodigal-gv
 ```
 ### 1.2 External Python packages:
 - BLAST+ with `blastn` available in `$PATH`
@@ -247,4 +247,5 @@ No prior publication yet for this tool. If you use this tool in your research, p
 > Kurniawan, D. 2026. findGEVE: GEVE identification tool in eukaryotic genome assemblies. https://github.com/dedee95/findGEVE
 
 ## 7. Acknowledgment
-Big thanks to [Dr. Frank Aylward](https://scholar.google.com/citations?user=JLV6g2AAAAAJ&hl=en) who made viralrecall version 1 and curated the hallmark HMM database. This tool Inspired by Viralrecall. 
+- Big thanks to [Dr. Frank Aylward](https://scholar.google.com/citations?user=JLV6g2AAAAAJ&hl=en) who made viralrecall version 1 and curated the hallmark HMM database. This tool Inspired by Viralrecall. 
+- Thank to Dr. Wang Sibo & Dr. Xu Yan for valuable suggestions to improve this tool.
