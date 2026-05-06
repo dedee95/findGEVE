@@ -18,25 +18,27 @@ Here, I present **findGEVE** for end-to-end GEVE identification, with output rea
 > *You can also read findGEVE introduction slide [here](docs/findGEVE_introduction.pdf)*
 
 ## Table of Contents
-- [1. Requirements](#1-requirements)
-  - [1.1 Third party Python packages](#11-third-party-python-packages)
-  - [1.2 External Python packages](#12-external-python-packages)
-  - [1.3 HMM database](#13-hmm-database)
-- [2. Installation](#2-installation)
-- [3. Quick usage guide](#3-quick-usage-guide)
-  - [3.1 Run with test data](#31-run-with-test-data)
-  - [3.2 Output files](#32-output-files)
-- [4. findGEVE algorithm detail](#4-findgeve-algorithm-detail)
-  - [4.1 ORF/Gene prediction](#41-orfgene-prediction)
-  - [4.2 HMM annotation](#42-hmm-annotation)
-  - [4.3 Seed candidate GEVE via hallmark clustering](#43-seed-candidate-geve-via-hallmark-clustering)
-  - [4.4 Rolling viral score calculation](#44-rolling-viral-score-calculation)
-  - [4.5 Per-cluster boundary refinement](#45-per-cluster-boundary-refinement)
-    - [4.5.1 TIR detection algorithm](#451-tir-detection-algorithm)
-  - [4.6 TSD identification algorithm](#46-tsd-identification-algorithm)
-- [5. Author](#5-author)
-- [6. Citation](#6-citation)
-- [7. Acknowledgment](#7-acknowledgment)
+- [findGEVE: GEVE identification tool in eukaryotic genome assemblies](#findgeve-geve-identification-tool-in-eukaryotic-genome-assemblies)
+  - [Table of Contents](#table-of-contents)
+  - [1. Requirements](#1-requirements)
+    - [1.1 Third party Python packages:](#11-third-party-python-packages)
+    - [1.2 External Python packages:](#12-external-python-packages)
+    - [1.3 HMM database](#13-hmm-database)
+  - [2. Installation](#2-installation)
+  - [3. Quick usage guide](#3-quick-usage-guide)
+    - [3.1 Run with test data](#31-run-with-test-data)
+    - [3.2 Output files](#32-output-files)
+  - [4. findGEVE algorithm detail](#4-findgeve-algorithm-detail)
+    - [4.1 ORF/Gene prediction](#41-orfgene-prediction)
+    - [4.2 HMM annotation](#42-hmm-annotation)
+    - [4.3 Seed candidate GEVE via hallmark clustering](#43-seed-candidate-geve-via-hallmark-clustering)
+    - [4.4 Rolling viral score calculation](#44-rolling-viral-score-calculation)
+    - [4.5 Per-cluster boundary refinement](#45-per-cluster-boundary-refinement)
+      - [4.5.1 TIR detection algorithm](#451-tir-detection-algorithm)
+    - [4.6 TSD identification algorithm](#46-tsd-identification-algorithm)
+  - [5. Author](#5-author)
+  - [6. Citation](#6-citation)
+  - [7. Acknowledgment](#7-acknowledgment)
 
 ---
 ## 1. Requirements
@@ -232,9 +234,9 @@ The detector scans `tsd_search_window = 60 bp` on each flank for a k-mer match w
 
 | k     | max miss | rationale                                             |
 | ----- | -------- | ----------------------------------------------------- |
-| ≤ 5   | 0        | short TSDs must be perfect to be credible             |
-| 6–8   | 1        | mid-length TSDs tolerate one mismatch                 |
-| ≥ 9   | 2        | long TSDs may carry mutations from age of integration |
+| `≤ 5`   | 0        | short TSDs must be perfect to be credible             |
+| `6–8`   | 1        | mid-length TSDs tolerate one mismatch                 |
+| `≥ 9`   | 2        | long TSDs may carry mutations from age of integration |
 
 Up to `tsd_max_slide = 2 bp` of positional offset is allowed on each side to absorb ±1–2 bp errors in the TIR boundary call. TSDs are only attempted when a TIR was found; without a defined boundary there is nothing to flank.
 ## 5. Author
