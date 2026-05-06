@@ -24,7 +24,7 @@ import numpy as np
 import pandas as pd
 import pyfastx
 import pyhmmer
-import pyrodigal
+import pyrodigal_gv
 
 HELP_TEXT = """\
 findGEVE.py - Identify Giant Endogenous Viral Elements (GEVEs) in eukaryotic genome assemblies.
@@ -83,6 +83,18 @@ DEFAULTS = dict(
     extend_max_bp       = 200_000,   
     extend_max_drops    = 2,
     evalue              = 1e-5,
+    hallmark_score_cutoffs = {
+        "A32":   80.0,
+        "D5":    80.0,
+        "SFII": 100.0,
+        "mcp":   80.0,
+        "mRNAc": 80.0,
+        "PolB": 200.0,
+        "RNAPL": 200.0,
+        "RNAPS": 200.0,
+        "RNR":   80.0,
+        "VLTF3": 80.0,
+    },
 )
 
 _NATKEY_RE = re.compile(r"(\d+)")
@@ -172,10 +184,10 @@ def _predict_orfs_on_contig(
 ) -> Tuple[str, List[Tuple], Optional[str]]:
     contig_name, seq = args
     try:
-        gf = pyrodigal.GeneFinder(meta=True)
+        gf = pyrodigal_gv.ViralGeneFinder(meta=True)
         genes = gf.find_genes(seq.encode("ascii"))
     except Exception as exc:
-        return contig_name, [], f"pyrodigal failed on {contig_name}: {exc}"
+        return contig_name, [], f"pyrodigal-gv failed on {contig_name}: {exc}"
     out = []
     for i, gene in enumerate(genes, start=1):
         prot = gene.translate().rstrip("*")
@@ -193,7 +205,7 @@ def predict_orfs(
     min_contig: int,
     threads: int,
 ) -> Tuple[Dict[str, Orf], Dict[str, int]]:
-    """Run pyrodigal meta on all contigs >= min_contig in parallel."""
+    """Run pyrodigal-gv meta on all contigs >= min_contig in parallel."""
     fa = pyfastx.Fasta(str(genome_path), build_index=True, uppercase=True)
     work_items: List[Tuple[str, str]] = []
     contig_lengths: Dict[str, int] = {}
@@ -273,6 +285,7 @@ def scan_hallmarks(
     hmm_path: Path,
     evalue: float,
     threads: int,
+    score_cutoffs: Optional[Dict[str, float]] = None,
 ) -> Dict[str, List[str]]:
     """Scan all proteins against NCLDV_markers.hmm.
 
@@ -287,18 +300,22 @@ def scan_hallmarks(
         _LOG.error(f"No HMM profiles in {hmm_path}")
         sys.exit(1)
 
+    score_cutoffs = score_cutoffs or {}
     contig2hits: Dict[str, List[str]] = defaultdict(list)
     n_hits = 0
     for top_hits in pyhmmer.hmmsearch(hmms, seqs, cpus=threads, E=evalue):
         hmm_name = _hmm_query_name(top_hits)
+        cutoff = score_cutoffs.get(hmm_name, 0.0)
         for hit in top_hits:
             if not hit.included:
+                continue
+            score = float(hit.score)
+            if score < cutoff:
                 continue
             target = hit.name.decode() if isinstance(hit.name, bytes) else hit.name
             o = orfs_by_id.get(target)
             if o is None:
                 continue
-            score = float(hit.score)
             if score > o.hallmark_bitscore:
                 o.hallmark = hmm_name
                 o.hallmark_bitscore = score
@@ -1527,6 +1544,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     contig2hallmark_hits = scan_hallmarks(
         orfs_by_id, hallmark_hmm,
         cfg["evalue"], args.threads,
+        score_cutoffs=cfg.get("hallmark_score_cutoffs"),
     )
 
     hallmark_contigs = set(contig2hallmark_hits.keys())
