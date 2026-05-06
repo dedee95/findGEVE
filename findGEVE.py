@@ -104,7 +104,6 @@ _NATKEY_RE = re.compile(r"(\d+)")
 def _natural_key(s: str):
     return [int(t) if t.isdigit() else t.lower() for t in _NATKEY_RE.split(str(s))]
 
-# Logging
 _LOG = logging.getLogger("findGEVE")
 
 OUTPUT = 25
@@ -130,34 +129,29 @@ def setup_logging(log_path: Optional[Path] = None) -> None:
         fh.setLevel(logging.DEBUG)
         _LOG.addHandler(fh)
 
-# Data classes
 @dataclass
 class Orf:
     orf_id: str
     contig: str
-    start: int           # 1-based inclusive
-    end: int             # 1-based inclusive
-    strand: int          # +1 / -1
+    start: int          
+    end: int             
+    strand: int          
     protein: str
-    # Hallmark
     hallmark: Optional[str] = None
     hallmark_bitscore: float = 0.0
     hallmark_evalue: float = float("inf")
-    # GVOG
     gvog: Optional[str] = None
     gvog_bitscore: float = 0.0
-    # Pfam
     best_pfam_acc: Optional[str] = None
     best_pfam_name: Optional[str] = None
     best_pfam_bitscore: float = 0.0
-    # Viral scoring
     virbit: float = 0.0
     pfambit: float = 0.0
     net_score: float = 0.0
 
 @dataclass
 class TirPair:
-    left_start: int      # genome-absolute, 1-based inclusive
+    left_start: int   
     left_end: int
     right_start: int
     right_end: int
@@ -168,7 +162,7 @@ class TirPair:
     matches: int
     total: int
     gaps: int
-    tir_evalue: float = float("nan")  # blastn e-value (NaN if not set)
+    tir_evalue: float = float("nan")
 
 @dataclass
 class Tsd:
