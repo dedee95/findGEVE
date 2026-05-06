@@ -67,6 +67,8 @@ DEFAULTS = dict(
     tir_max_len         = 10_000,
     tir_min_id          = 65.0, 
     tir_bracket_fraction= 0.5,
+    tir_min_dinuc_entropy = 1.5,
+    tir_max_kmer_fraction = 0.70,
     blastn_word_size    = 7,        
     blastn_reward       = 1,         
     blastn_penalty      = -1,        
@@ -612,6 +614,65 @@ def run_blastn_self(
             proc.returncode, cmd, output=proc.stdout, stderr=proc.stderr
         )
 
+def _dinucleotide_entropy(seq: str) -> float:
+    """Shannon entropy (bits) of overlapping ACGT dinucleotides."""
+    if len(seq) < 2:
+        return 0.0
+    seq = seq.upper()
+    counts: Counter = Counter()
+    for i in range(len(seq) - 1):
+        di = seq[i:i + 2]
+        if "N" in di:
+            continue
+        counts[di] += 1
+    total = sum(counts.values())
+    if total == 0:
+        return 0.0
+    entropy = 0.0
+    for c in counts.values():
+        p = c / total
+        entropy -= p * np.log2(p)
+    return entropy
+
+def _max_kmer_fraction(seq: str, k: int) -> float:
+    """Maximum fraction of any single k-mer across all phase offsets (non-overlapping tiling)."""
+    seq = seq.upper()
+    n = len(seq)
+    if n < k:
+        return 0.0
+    best = 0.0
+    for phase in range(k):
+        kmers = [seq[i:i + k] for i in range(phase, n - k + 1, k)]
+        kmers = [km for km in kmers if "N" not in km]
+        if not kmers:
+            continue
+        counts = Counter(kmers)
+        max_count = max(counts.values())
+        frac = max_count / len(kmers)
+        if frac > best:
+            best = frac
+    return best
+
+def _tir_is_low_complexity(
+    seq: str,
+    min_entropy: float,
+    max_kmer_fraction: float,
+) -> Tuple[bool, str]:
+    """Reject TIRs that are dinucleotide repeats or simple k-mer repeats.
+
+    Returns (is_low_complexity, reason).
+    """
+    if not seq:
+        return True, "empty TIR sequence"
+    entropy = _dinucleotide_entropy(seq)
+    if entropy < min_entropy:
+        return True, f"dinuc_entropy={entropy:.2f}<{min_entropy}"
+    for k in (1, 2, 3, 4):
+        frac = _max_kmer_fraction(seq, k)
+        if frac > max_kmer_fraction:
+            return True, f"{k}-mer_fraction={frac:.2f}>{max_kmer_fraction}"
+    return False, ""
+
 def _count_bracketed(
     tir: TirPair,
     hallmark_intervals: List[Tuple[int, int]],
@@ -627,6 +688,7 @@ def select_best_tir(
     region_offset: int,
     hallmark_intervals: List[Tuple[int, int]],
     cfg: dict,
+    region_seq: Optional[str] = None,
 ) -> Tuple[Optional[TirPair], dict]:
     """Filter and rank TIR pairs. Returns (best_tir, diagnostics_dict)."""
     bracket_fraction = cfg.get("tir_bracket_fraction", 0.5)
@@ -637,9 +699,13 @@ def select_best_tir(
         if require_bracket else 0
     )
 
+    min_entropy   = cfg.get("tir_min_dinuc_entropy", 1.5)
+    max_kmer_frac = cfg.get("tir_max_kmer_fraction", 0.70)
+
     diag = dict(
         n_raw=len(pairs),
-        n_pass_insert=0, n_pass_len=0, n_pass_id=0, n_pass_bracket=0,
+        n_pass_insert=0, n_pass_len=0, n_pass_id=0,
+        n_pass_complexity=0, n_pass_bracket=0,
         best_near_miss="",
     )
 
@@ -655,6 +721,15 @@ def select_best_tir(
         ok_insert = cfg["tir_min_insert"] <= t.insert_size <= cfg["tir_max_insert"]
         ok_len    = cfg["tir_min_len"]    <= t.tir_length  <= cfg["tir_max_len"]
         ok_id     = t.tir_identity >= cfg["tir_min_id"]
+
+        ok_complexity = True
+        complexity_reason = "ok"
+        if region_seq is not None:
+            tir_seq = region_seq[t.left_start - 1: t.left_end]
+            is_lc, reason = _tir_is_low_complexity(tir_seq, min_entropy, max_kmer_frac)
+            if is_lc:
+                ok_complexity = False
+                complexity_reason = reason
 
         abs_tir = TirPair(
             left_start=gl_start, left_end=gl_end,
@@ -678,10 +753,13 @@ def select_best_tir(
             diag["n_pass_len"] += 1
         if ok_insert and ok_len and ok_id:
             diag["n_pass_id"] += 1
-        if ok_insert and ok_len and ok_id and ok_bracket:
+        if ok_insert and ok_len and ok_id and ok_complexity:
+            diag["n_pass_complexity"] += 1
+        if ok_insert and ok_len and ok_id and ok_complexity and ok_bracket:
             diag["n_pass_bracket"] += 1
 
-        score = sum([ok_insert, ok_len, ok_id, ok_bracket]) * 1e6 + t.tir_identity * t.tir_length
+        score = (sum([ok_insert, ok_len, ok_id, ok_complexity, ok_bracket]) * 1e6
+                 + t.tir_identity * t.tir_length)
         if score > near_miss_score:
             near_miss_score = score
             diag["best_near_miss"] = (
@@ -689,9 +767,11 @@ def select_best_tir(
                 f"id={t.tir_identity:.1f}% "
                 f"bracketed={n_bracketed}/{n_hallmarks_total} "
                 f"(need>={min_required}) "
-                f"passed=[insert:{ok_insert},len:{ok_len},id:{ok_id},bracket:{ok_bracket}]"
+                f"complexity={complexity_reason} "
+                f"passed=[insert:{ok_insert},len:{ok_len},id:{ok_id},"
+                f"complexity:{ok_complexity},bracket:{ok_bracket}]"
             )
-        if not (ok_insert and ok_len and ok_id and ok_bracket):
+        if not (ok_insert and ok_len and ok_id and ok_complexity and ok_bracket):
             continue
 
         valid.append((n_bracketed, abs_tir))
@@ -803,6 +883,7 @@ def _try_blastn_at_flank(
     best, diag = select_best_tir(
         pairs, region_offset=rstart,
         hallmark_intervals=hallmark_intervals, cfg=cfg,
+        region_seq=region_seq,
     )
     if best is not None:
         return best, diag, ""
@@ -815,6 +896,7 @@ def _try_blastn_at_flank(
             f"{diag['n_pass_insert']} insert, "
             f"{diag['n_pass_len']} len, "
             f"{diag['n_pass_id']} id, "
+            f"{diag['n_pass_complexity']} complexity, "
             f"{diag['n_pass_bracket']} bracket); "
             f"best near-miss: {diag['best_near_miss']}"
         )
