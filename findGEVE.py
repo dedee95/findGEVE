@@ -67,8 +67,10 @@ DEFAULTS = dict(
     tir_max_len         = 10_000,
     tir_min_id          = 65.0, 
     tir_bracket_fraction= 0.5,
-    tir_min_dinuc_entropy = 1.5,
+    tir_min_dinuc_entropy = 2.0,
     tir_max_kmer_fraction = 0.70,
+    tir_max_tandem_fraction = 0.70,
+    tir_tandem_max_period = 12,
     blastn_word_size    = 7,        
     blastn_reward       = 1,         
     blastn_penalty      = -1,        
@@ -527,7 +529,6 @@ def parse_blastn_tabular(tab_path: Path) -> List[TirPair]:
             continue
         fields = line.split("\t")
         if len(fields) < len(_BLASTN_COLUMNS):
-            # Tolerate truncated lines silently (e.g. blastn warnings on stdout).
             continue
         try:
             qstart   = int(fields[0])
@@ -543,17 +544,13 @@ def parse_blastn_tabular(tab_path: Path) -> List[TirPair]:
         except (ValueError, IndexError):
             continue
 
-        # Work in plus-strand intervals: blastn gives qstart<=qend always,
-        # but sstart>send under -strand minus.
         left_local_start  = min(qstart, qend)
         left_local_end    = max(qstart, qend)
         right_local_start = min(sstart, send)
         right_local_end   = max(sstart, send)
 
-        # Drop overlapping arms (palindromic self-hit at the boundary).
         if left_local_end >= right_local_start:
             continue
-        # Drop the symmetric A->B / B->A duplicate; keep left arm upstream.
         if left_local_start > right_local_start:
             continue
 
@@ -647,12 +644,37 @@ def _max_kmer_fraction(seq: str, k: int) -> float:
             best = frac
     return best
 
+def _max_tandem_period_fraction(seq: str, max_period: int) -> float:
+    """Maximum fraction of positions i where seq[i] == seq[i+p] across periods p=1..max_period."""
+    seq = seq.upper()
+    n = len(seq)
+    if n < 2 or max_period < 1:
+        return 0.0
+    best = 0.0
+    for p in range(1, min(max_period, n - 1) + 1):
+        matches = total = 0
+        for i in range(n - p):
+            a, b = seq[i], seq[i + p]
+            if a == "N" or b == "N":
+                continue
+            total += 1
+            if a == b:
+                matches += 1
+        if total == 0:
+            continue
+        frac = matches / total
+        if frac > best:
+            best = frac
+    return best
+
 def _tir_is_low_complexity(
     seq: str,
     min_entropy: float,
     max_kmer_fraction: float,
+    max_tandem_fraction: float,
+    max_tandem_period: int,
 ) -> Tuple[bool, str]:
-    """Reject TIRs that are dinucleotide repeats or simple k-mer repeats.
+    """Reject TIRs that are simple repeats or low-complexity sequences.
 
     Returns (is_low_complexity, reason).
     """
@@ -665,6 +687,9 @@ def _tir_is_low_complexity(
         frac = _max_kmer_fraction(seq, k)
         if frac > max_kmer_fraction:
             return True, f"{k}-mer_fraction={frac:.2f}>{max_kmer_fraction}"
+    tandem_frac = _max_tandem_period_fraction(seq, max_tandem_period)
+    if tandem_frac > max_tandem_fraction:
+        return True, f"tandem_fraction={tandem_frac:.2f}>{max_tandem_fraction}"
     return False, ""
 
 def _count_bracketed(
@@ -693,8 +718,10 @@ def select_best_tir(
         if require_bracket else 0
     )
 
-    min_entropy   = cfg.get("tir_min_dinuc_entropy", 1.5)
-    max_kmer_frac = cfg.get("tir_max_kmer_fraction", 0.70)
+    min_entropy        = cfg.get("tir_min_dinuc_entropy", 2.0)
+    max_kmer_frac      = cfg.get("tir_max_kmer_fraction", 0.70)
+    max_tandem_frac    = cfg.get("tir_max_tandem_fraction", 0.70)
+    max_tandem_period  = cfg.get("tir_tandem_max_period", 12)
 
     diag = dict(
         n_raw=len(pairs),
@@ -703,7 +730,7 @@ def select_best_tir(
         best_near_miss="",
     )
 
-    valid: List[Tuple[int, TirPair]] = []   # (n_bracketed, tir)
+    valid: List[Tuple[int, TirPair]] = []  
     near_miss_score = -1.0
 
     for t in pairs:
@@ -719,11 +746,17 @@ def select_best_tir(
         ok_complexity = True
         complexity_reason = "ok"
         if region_seq is not None:
-            tir_seq = region_seq[t.left_start - 1: t.left_end]
-            is_lc, reason = _tir_is_low_complexity(tir_seq, min_entropy, max_kmer_frac)
-            if is_lc:
+            left_seq  = region_seq[t.left_start  - 1: t.left_end]
+            right_seq = region_seq[t.right_start - 1: t.right_end]
+            is_lc_l, reason_l = _tir_is_low_complexity(
+                left_seq, min_entropy, max_kmer_frac, max_tandem_frac, max_tandem_period
+            )
+            is_lc_r, reason_r = _tir_is_low_complexity(
+                right_seq, min_entropy, max_kmer_frac, max_tandem_frac, max_tandem_period
+            )
+            if is_lc_l or is_lc_r:
                 ok_complexity = False
-                complexity_reason = reason
+                complexity_reason = f"L:{reason_l or 'ok'} R:{reason_r or 'ok'}"
 
         abs_tir = TirPair(
             left_start=gl_start, left_end=gl_end,
@@ -921,7 +954,6 @@ def extend_tirless_boundaries(
     if not sorted_orfs:
         return cluster_start, cluster_end, diag
 
-    # Indices of the ORFs that bracket the seed cluster span.
     left_idx: Optional[int] = None
     right_idx: Optional[int] = None
     for i, o in enumerate(sorted_orfs):
@@ -932,7 +964,6 @@ def extend_tirless_boundaries(
     if left_idx is None or right_idx is None:
         return cluster_start, cluster_end, diag
 
-    # Walk left.
     new_start = cluster_start
     drops = 0
     i = left_idx - 1
@@ -957,7 +988,6 @@ def extend_tirless_boundaries(
                 break
         i -= 1
 
-    # Walk right (uses already-extended new_start when checking max_span).
     new_end = cluster_end
     drops = 0
     i = right_idx + 1
@@ -1032,8 +1062,6 @@ def _process_cluster(task: dict) -> dict:
             f"viral-score pre-scan skipped (--no-extend-tirless)"
         ))
 
-    # Hallmark intervals gathered from the full pre-scan span so the TIR
-    # bracket test sees ALL hallmarks, not just those inside the narrow seed.
     hallmark_intervals: List[Tuple[int, int]] = [
         (o.start, o.end)
         for o in contig_orfs
@@ -1070,7 +1098,6 @@ def _process_cluster(task: dict) -> dict:
                 flank_used = flank
                 break
             last_note = note
-            # Stop early when the contig is already fully included on both sides.
             rstart = max(1, pre_start - flank)
             rend   = min(clen, pre_end + flank)
             if rstart == 1 and rend == clen:
@@ -1110,7 +1137,6 @@ def _process_cluster(task: dict) -> dict:
             ),
         )
 
-    # ORFs inside final GEVE span
     geve_orfs = [o for o in contig_orfs
                  if o.start >= geve_start and o.end <= geve_end]
     geve_orfs.sort(key=lambda x: x.start)
@@ -1227,6 +1253,7 @@ def write_summary_tsv(geves: List[dict], path: Path) -> None:
             geve_length    = g["geve_length"],
             gc             = round(g["gc_geve"], 2),
             total_cds      = len(orfs),
+            n_viral_hits   = sum(1 for o in orfs if o.hallmark or o.gvog),
             coding_density = cod,
             n_hallmarks    = g["n_hallmarks"],
             hallmarks      = ",".join(g["hallmarks_present"]),
@@ -1508,8 +1535,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("-e", "--evalue", type=float, default=DEFAULTS["evalue"])
     p.add_argument("--blastn-jobs", type=int, default=None)
     p.add_argument("--min-hallmark-type", type=int, default=DEFAULTS["min_hallmarks"])
-
-    # Advanced — hidden from --help; adjust via DEFAULTS block at top of script
     p.add_argument("--blastn-threads",       type=int,   default=1)
     p.add_argument("--min-contig",           type=int,   default=DEFAULTS["min_contig"])
     p.add_argument("--min-geve-length",      type=int,   default=DEFAULTS["min_geve_length"])
@@ -1548,7 +1573,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     log_path = args.outdir / "run.log"
     setup_logging(log_path)
 
-    # Resolve blastn parallelism. Two knobs:
     blastn_threads = max(1, int(args.blastn_threads))
     if args.blastn_jobs is not None:
         blastn_jobs = max(1, int(args.blastn_jobs))
@@ -1687,8 +1711,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             blastn_threads=blastn_threads,
         ))
 
-    # Auto-balance: when --blastn-jobs was not explicitly set and there are
-    # fewer clusters than threads, give each cluster more blastn threads.
     if (args.blastn_jobs is None
             and args.blastn_threads == 1
             and len(tasks) < args.threads):
