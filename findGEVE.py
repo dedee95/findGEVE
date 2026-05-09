@@ -256,12 +256,21 @@ def predict_orfs(
     return orfs_by_id, contig_lengths
 
 # Stage 2: HMM scans
+_HMMER_MAX_TARGET_LEN = 100_000
+
 def _digital_seqs(
     orfs: Iterable[Orf],
     alphabet: pyhmmer.easel.Alphabet,
 ) -> List[pyhmmer.easel.DigitalSequence]:
     out = []
     for o in orfs:
+        if len(o.protein) > _HMMER_MAX_TARGET_LEN:
+            _LOG.warning(
+                f"Skipping ORF {o.orf_id} on {o.contig}: protein length "
+                f"{len(o.protein):,} aa exceeds HMMER pipeline limit "
+                f"({_HMMER_MAX_TARGET_LEN:,} aa)"
+            )
+            continue
         try:
             t = pyhmmer.easel.TextSequence(
                 name=o.orf_id.encode(), sequence=o.protein
