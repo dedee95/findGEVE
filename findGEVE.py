@@ -1253,7 +1253,7 @@ def write_summary_tsv(geves: List[dict], path: Path) -> None:
             geve_length    = g["geve_length"],
             gc             = round(g["gc_geve"], 2),
             total_cds      = len(orfs),
-            n_viral_hits   = sum(1 for o in orfs if o.hallmark or o.gvog),
+            NCLDV_hits     = sum(1 for o in orfs if o.hallmark or o.gvog),
             coding_density = cod,
             n_hallmarks    = g["n_hallmarks"],
             hallmarks      = ",".join(g["hallmarks_present"]),
