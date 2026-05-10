@@ -47,7 +47,7 @@ This tool is fully written in Python and mostly uses third-party Python packages
 - `numpy` v1.24 or hinger
 - `pandas`  v2.0 or hinger
 - `pyfastx` v2.3.0
-- `pyhmmer` v3.3.2
+- `pyhmmer` v0.12.0
 - `pyrodigal-gv` v0.3.2
 
 ```
@@ -58,7 +58,7 @@ pip install numpy pandas pyfastx pyhmmer pyrodigal-gv
 conda install -c conda-forge -c bioconda numpy pandas pyfastx pyhmmer pyrodigal-gv
 ```
 ### 1.2 External Python packages:
-- BLAST+ with `blastn` available in `$PATH`
+- BLAST+ with `blastn` v2.17.0+ available in `$PATH`
 
 ```
 # install using conda
