@@ -34,7 +34,7 @@ Usage: findGEVE.py -db <directory> --prefix <prefix> <genome.fa> [OPTIONS]
 
 Mandatory:
   -db, --db            HMM database directory (must contain NCLDV_markers.hmm
-                       and gvog.hmm; Pfam-A.hmm is optional)
+                       and gvog.complete.hmm; Pfam-A.hmm is optional)
   --prefix             Output prefix for GEVE IDs and file names
   genome               Input genome assembly FASTA (gzip is acceptable)
 
@@ -149,9 +149,11 @@ class Orf:
     hallmark_evalue: float = float("inf")
     gvog: Optional[str] = None
     gvog_bitscore: float = 0.0
+    gvog_evalue: float = float("inf")
     best_pfam_acc: Optional[str] = None
     best_pfam_name: Optional[str] = None
     best_pfam_bitscore: float = 0.0
+    best_pfam_evalue: float = float("inf")
     virbit: float = 0.0
     pfambit: float = 0.0
     net_score: float = 0.0
@@ -347,7 +349,7 @@ def scan_gvog(
     evalue: float,
     threads: int,
 ) -> None:
-    """Scan a subset of proteins against gvog.hmm. Sets Orf.virbit."""
+    """Scan a subset of proteins against gvog.complete.hmm Sets Orf.virbit."""
     if not orfs_to_scan:
         return
     alphabet = pyhmmer.easel.Alphabet.amino()
@@ -369,6 +371,7 @@ def scan_gvog(
                 if score > o.gvog_bitscore:
                     o.gvog = hmm_name
                     o.gvog_bitscore = score
+                    o.gvog_evalue = float(hit.evalue)
                     o.virbit = score
                 n_hits += 1
 
@@ -407,6 +410,7 @@ def scan_pfam(
                 score = float(hit.score)
                 if score > o.best_pfam_bitscore:
                     o.best_pfam_bitscore = score
+                    o.best_pfam_evalue = float(hit.evalue)
                     o.best_pfam_acc = acc
                     o.best_pfam_name = hmm_name
                     o.pfambit = score
@@ -1291,6 +1295,96 @@ def _tir_fields(tir: Optional[TirPair]) -> dict:
         tir_gaps=tir.gaps,
     )
 
+def load_gvog_annotations(db: Path) -> Dict[str, str]:
+    """Load GVOG name lookup from gvog.complete.annot.tsv if present.
+
+    Returns a dict mapping GVOG ID -> first-token NCVOG description.
+    Missing file or unexpected format is non-fatal: logs a warning and
+    returns an empty dict so the pipeline still completes (gvog_name
+    becomes NA in the functional annotation output).
+    """
+    path = db / "gvog.complete.annot.tsv"
+    if not path.exists():
+        _LOG.warning(
+            f"GVOG annotation file not found: {path}; "
+            f"gvog_name will be NA in {{prefix}}.geve.func.tsv"
+        )
+        return {}
+    try:
+        df = pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False)
+    except Exception as exc:
+        _LOG.warning(f"Failed to load GVOG annotations from {path}: {exc}")
+        return {}
+    if "GVOG" not in df.columns or "NCVOG_descs" not in df.columns:
+        _LOG.warning(
+            f"Expected columns 'GVOG' and 'NCVOG_descs' missing in "
+            f"{path.name}; gvog_name will be NA"
+        )
+        return {}
+    name_map: Dict[str, str] = {}
+    for _, row in df.iterrows():
+        gid = (row.get("GVOG") or "").strip()
+        if not gid:
+            continue
+        descs = (row.get("NCVOG_descs") or "").strip()
+        if not descs:
+            continue
+
+        first = descs.split(" | ")[0].strip()
+        if first:
+            name_map[gid] = first
+    _LOG.info(
+        f"Loaded {len(name_map):,} GVOG name annotations from {path.name}"
+    )
+    return name_map
+
+
+def write_protein_func_tsv(
+    geves: List[dict],
+    path: Path,
+    gvog_name_map: Dict[str, str],
+) -> None:
+    """Write per-protein functional annotation table for retained GEVEs.
+
+    Emits one row per ORF in every retained GEVE (in .pep order). Best-hit
+    annotation is reported for GVOG and Pfam scans.
+    Missing values are written as 'NA'.
+    """
+    def _fmt_score(v: float) -> str:
+        return f"{v:.1f}" if v and v > 0 else "NA"
+
+    def _fmt_evalue(v: float) -> str:
+        if v is None or v == float("inf") or not np.isfinite(v):
+            return "NA"
+        return f"{v:.2e}"
+
+    def _fmt_str(s: Optional[str]) -> str:
+        return s if s else "NA"
+
+    rows = []
+    for g in geves:
+        geve_id = g["geve_id"]
+        for orf_idx, o in enumerate(g["orfs"], start=1):
+            if o.hallmark is None and o.gvog is None and o.best_pfam_acc is None:
+                continue
+            label     = f"orf{orf_idx:05d}"
+            gvog_name = gvog_name_map.get(o.gvog, "") if o.gvog else ""
+            rows.append(dict(
+                geve_id           = geve_id,
+                protein_id        = label,
+                gvog_bitscore     = _fmt_score(o.gvog_bitscore),
+                gvog_evalue       = _fmt_evalue(o.gvog_evalue),
+                gvog_id           = _fmt_str(o.gvog),
+                gvog_name         = _fmt_str(gvog_name),
+                pfam_bitscore     = _fmt_score(o.best_pfam_bitscore),
+                pfam_evalue       = _fmt_evalue(o.best_pfam_evalue),
+                pfam_id           = _fmt_str(o.best_pfam_acc),
+                pfam_name         = _fmt_str(o.best_pfam_name),
+            ))
+    df = pd.DataFrame(rows)
+    df.to_csv(path, sep="\t", index=False)
+
+
 def write_summary_tsv(geves: List[dict], path: Path) -> None:
     rows = []
     for g in geves:
@@ -1600,6 +1694,7 @@ def _write_empty_outputs(outdir: Path, prefix: str, genome_path: Path, t0: float
     )
     (outdir / f"{prefix}.geve.gff3").write_text("##gff-version 3\n")
     pd.DataFrame().to_csv(outdir / f"{prefix}.summary.tsv", sep="\t", index=False)
+    pd.DataFrame().to_csv(outdir / f"{prefix}.geve.func.tsv", sep="\t", index=False)
     log_run_summary([], prefix, genome_path, time.time() - t0)
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -1656,10 +1751,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     db = args.db
     hallmark_hmm = db / "NCLDV_markers.hmm"
-    gvog_hmm     = db / "gvog.hmm"
+    gvog_hmm     = db / "gvog.complete.hmm"
     pfam_hmm     = db / "Pfam-A.hmm"
 
-    for f, label in [(hallmark_hmm, "NCLDV_markers.hmm"), (gvog_hmm, "gvog.hmm")]:
+    for f, label in [(hallmark_hmm, "NCLDV_markers.hmm"), (gvog_hmm, "gvog.complete.hmm")]:
         if not f.exists():
             _LOG.error(f"Required HMM not found: {f} ({label})")
             return 2
@@ -1854,6 +1949,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     marker_path   = out / f"{args.prefix}.markerout"
     summary_path  = out / f"{args.prefix}.summary.tsv"
     gff3_path     = out / f"{args.prefix}.geve.gff3"
+    func_path     = out / f"{args.prefix}.geve.func.tsv"
+
+    gvog_name_map = load_gvog_annotations(db)
 
     write_multifasta(raw_geves, fa, fasta_path)
     write_protein_fasta(raw_geves, pep_path)
@@ -1861,6 +1959,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     write_markerout(raw_geves, marker_path)
     write_summary_tsv(raw_geves, summary_path)
     write_gff3(raw_geves, gff3_path)
+    write_protein_func_tsv(raw_geves, func_path, gvog_name_map)
     hallmark_pep_paths = write_hallmark_peps(raw_geves, out, args.prefix)
 
     _LOG.output(f"GEVE sequences  -> {fasta_path}")
@@ -1869,6 +1968,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     _LOG.output(f"Marker annot    -> {marker_path}")
     _LOG.output(f"Summary table   -> {summary_path}")
     _LOG.output(f"GFF3 annotation -> {gff3_path}")
+    _LOG.output(f"Functional annot-> {func_path}")
     for hp in hallmark_pep_paths:
         _LOG.output(f"Hallmark pep    -> {hp}")
     _LOG.output(f"Run log         -> {log_path}")
