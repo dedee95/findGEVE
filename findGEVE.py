@@ -18,6 +18,7 @@ from collections import Counter, defaultdict
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 import numpy as np
@@ -38,12 +39,14 @@ Mandatory:
   genome               Input genome assembly FASTA (gzip is acceptable)
 
 Optional:
-  --outdir             Output directory                              [default: ./Result_<YYYYMMDD>]
+  -o, --outdir         Output directory                              [default: ./Result_<YYYYMMDD>]
   -t, --threads        CPU threads for ORF prediction and HMM search [default: 4]
   -e, --evalue         E-value cutoff for HMM searches               [default: 1e-5]
   --blastn-jobs        Parallel TIR-detection workers                [default: --threads]
   --min-hallmark-type  Minimum number of distinct hallmark types
                        required per cluster                          [default: 2]
+  --min-contig         Minimum contig length to scan for GEVE 
+                       detection                                     [default: 50000]
   -h, --help           Show this help and exit
 """
 
@@ -55,7 +58,7 @@ DEFAULTS = dict(
     min_geve_length     = 50_000,   
     min_hallmarks       = 2,         
     seed_window         = 300_000,   
-    cluster_merge_gap   = 100_000,  
+    cluster_merge_gap   = 50_000,
     max_cluster_span    = 2_000_000,
     rolling_window      = 15,
     tir_flank_start     = 100_000,
@@ -66,7 +69,7 @@ DEFAULTS = dict(
     tir_min_len         = 10,    
     tir_max_len         = 10_000,
     tir_min_id          = 65.0, 
-    tir_bracket_fraction= 0.5,
+    tir_bracket_fraction= 1.0,
     tir_min_dinuc_entropy = 2.0,
     tir_max_kmer_fraction = 0.70,
     tir_max_tandem_fraction = 0.70,
@@ -83,9 +86,11 @@ DEFAULTS = dict(
     tsd_max_slide       = 2,
     tsd_search_window   = 60,     
     extend_tirless      = True,      
-    extend_threshold    = 0.0,       
+    extend_threshold    = -0.5,
+    extend_start_threshold = 0.0,
     extend_max_bp       = 200_000,   
     extend_max_drops    = 2,
+    n_max_fraction      = 0.05,
     evalue              = 1e-5,
     hallmark_score_cutoffs = {
         "A32":   80.0,
@@ -410,16 +415,34 @@ def scan_pfam(
     _LOG.info(f"Pfam-A scan: {n_hits:,} hit(s)")
 
 # Stage 3: seeding
+def _gap_is_host_territory(
+    prev_end: int,
+    curr_start: int,
+    contig_orfs: List[Orf],
+    rolling: Dict[str, float],
+) -> bool:
+    """Gap looks like host: no hallmark/GVOG hits AND rolling score crosses zero."""
+    gap_orfs = [o for o in contig_orfs
+                if o.start > prev_end and o.end < curr_start]
+    if not gap_orfs:
+        return False
+    if any(o.hallmark is not None or o.gvog is not None for o in gap_orfs):
+        return False
+    return any(rolling.get(o.orf_id, 0.0) < 0 for o in gap_orfs)
+
+
 def find_seed_clusters(
     orfs_by_contig: Dict[str, List[Orf]],
     window_size: int,
     min_hallmarks: int,
     cluster_merge_gap: int,
     max_cluster_span: int,
+    rolling_by_orf_per_contig: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> List[dict]:
     """Identify candidate GEVE clusters by sliding window over hallmark ORFs."""
     half = window_size // 2
     raw: List[dict] = []
+    rolling_by_orf_per_contig = rolling_by_orf_per_contig or {}
 
     for contig, orfs in orfs_by_contig.items():
         hallmark_orfs = [o for o in orfs if o.hallmark is not None]
@@ -458,22 +481,29 @@ def find_seed_clusters(
             overlap_merged.append(dict(c))
 
     merged: List[dict] = []
+    n_refused = 0
     for c in overlap_merged:
         if merged and merged[-1]["contig"] == c["contig"]:
             prev = merged[-1]
             gap = c["cluster_start"] - prev["cluster_end"] - 1
             new_span = c["cluster_end"] - prev["cluster_start"] + 1
             if 0 <= gap <= cluster_merge_gap and new_span <= max_cluster_span:
-                prev["cluster_end"] = c["cluster_end"]
-                prev["orf_ids"]   = sorted(set(prev["orf_ids"])   | set(c["orf_ids"]))
-                prev["hallmarks"] = sorted(set(prev["hallmarks"]) | set(c["hallmarks"]))
-                continue
+                contig_orfs = orfs_by_contig.get(c["contig"], [])
+                rolling = rolling_by_orf_per_contig.get(c["contig"], {})
+                if not _gap_is_host_territory(
+                        prev["cluster_end"], c["cluster_start"], contig_orfs, rolling):
+                    prev["cluster_end"] = c["cluster_end"]
+                    prev["orf_ids"]   = sorted(set(prev["orf_ids"])   | set(c["orf_ids"]))
+                    prev["hallmarks"] = sorted(set(prev["hallmarks"]) | set(c["hallmarks"]))
+                    continue
+                n_refused += 1
         merged.append(dict(c))
 
     _LOG.info(
         f"Seeding: {len(merged)} candidate region(s) "
         f"(>= {min_hallmarks} distinct hallmarks within {window_size:,} bp; "
-        f"merged within {cluster_merge_gap:,} bp, max span {max_cluster_span:,} bp)"
+        f"merged within {cluster_merge_gap:,} bp, max span {max_cluster_span:,} bp; "
+        f"{n_refused} merge(s) refused as host territory)"
     )
     return merged
 
@@ -482,37 +512,26 @@ def compute_rolling_scores(
     orfs_by_contig: Dict[str, List[Orf]],
     rolling_window: int,
     candidate_contigs: set,
-) -> Dict[str, pd.DataFrame]:
-    """Compute net_score = virbit - pfambit and rolling mean per candidate contig."""
-    result: Dict[str, pd.DataFrame] = {}
+) -> Dict[str, Dict[str, float]]:
+    """Centered rolling mean of net_score per ORF, vectorized via cumulative sums."""
+    half = rolling_window // 2
+    result: Dict[str, Dict[str, float]] = {}
     for contig in candidate_contigs:
         orfs = sorted(orfs_by_contig.get(contig, []), key=lambda x: x.start)
         if not orfs:
             continue
-        rows = [dict(
-            orf_id=o.orf_id,
-            start=o.start, end=o.end,
-            strand=("+" if o.strand >= 0 else "-"),
-            hallmark=o.hallmark or "no_hit",
-            hallmark_score=o.hallmark_bitscore,
-            hallmark_evalue=o.hallmark_evalue,
-            gvog=o.gvog or "no_hit",
-            gvog_score=o.gvog_bitscore,
-            pfam=o.best_pfam_name or "no_hit",
-            pfam_acc=o.best_pfam_acc or "no_hit",
-            pfam_score=o.best_pfam_bitscore,
-            virbit=o.virbit,
-            pfambit=o.pfambit,
-            net_score=o.net_score,
-        ) for o in orfs]
-        df = pd.DataFrame(rows)
-        df["rolling"] = (
-            df["net_score"]
-              .rolling(rolling_window, min_periods=3, center=True)
-              .mean()
-              .fillna(0)
-        )
-        result[contig] = df
+        scores = np.fromiter((o.net_score for o in orfs), dtype=np.float64, count=len(orfs))
+        n = scores.size
+        if n == 0:
+            continue
+        idx = np.arange(n)
+        lo = np.maximum(0, idx - half)
+        hi = np.minimum(n, idx + half + 1)
+        cumsum = np.concatenate(([0.0], np.cumsum(scores)))
+        window_sums = cumsum[hi] - cumsum[lo]
+        window_sizes = (hi - lo).astype(np.float64)
+        rolling = np.where(window_sizes >= 3, window_sums / np.maximum(window_sizes, 1), 0.0)
+        result[contig] = {orfs[i].orf_id: float(rolling[i]) for i in range(n)}
     return result
 
 
@@ -636,41 +655,40 @@ def _dinucleotide_entropy(seq: str) -> float:
 
 def _max_kmer_fraction(seq: str, k: int) -> float:
     """Maximum fraction of any single k-mer across all phase offsets (non-overlapping tiling)."""
-    seq = seq.upper()
-    n = len(seq)
+    arr = seq.upper().encode("ascii")
+    n = len(arr)
     if n < k:
         return 0.0
     best = 0.0
     for phase in range(k):
-        kmers = [seq[i:i + k] for i in range(phase, n - k + 1, k)]
-        kmers = [km for km in kmers if "N" not in km]
-        if not kmers:
+        tiles = [arr[i:i + k] for i in range(phase, n - k + 1, k)]
+        valid = [t for t in tiles if b"N" not in t]
+        if not valid:
             continue
-        counts = Counter(kmers)
+        counts = Counter(valid)
         max_count = max(counts.values())
-        frac = max_count / len(kmers)
+        frac = max_count / len(valid)
         if frac > best:
             best = frac
     return best
 
 def _max_tandem_period_fraction(seq: str, max_period: int) -> float:
     """Maximum fraction of positions i where seq[i] == seq[i+p] across periods p=1..max_period."""
-    seq = seq.upper()
-    n = len(seq)
+    arr = np.frombuffer(seq.upper().encode("ascii"), dtype=np.uint8)
+    n = arr.size
     if n < 2 or max_period < 1:
         return 0.0
+    n_byte = ord("N")
+    upper_p = min(max_period, n - 1)
     best = 0.0
-    for p in range(1, min(max_period, n - 1) + 1):
-        matches = total = 0
-        for i in range(n - p):
-            a, b = seq[i], seq[i + p]
-            if a == "N" or b == "N":
-                continue
-            total += 1
-            if a == b:
-                matches += 1
+    for p in range(1, upper_p + 1):
+        a = arr[:-p]
+        b = arr[p:]
+        valid = (a != n_byte) & (b != n_byte)
+        total = int(valid.sum())
         if total == 0:
             continue
+        matches = int((valid & (a == b)).sum())
         frac = matches / total
         if frac > best:
             best = frac
@@ -881,63 +899,6 @@ def gc_of_seq(seq: str) -> float:
     return float(100.0 * gc / valid) if valid > 0 else float("nan")
 
 # Stage 8: per-cluster worker (TIR + TSD + GC)
-def _try_blastn_at_flank(
-    contig: str,
-    cstart: int,
-    cend: int,
-    clen: int,
-    flank: int,
-    cfg: dict,
-    fa: pyfastx.Fasta,
-    hallmark_intervals: List[Tuple[int, int]],
-    tmp: Path,
-    ci: int,
-    blastn_threads: int = 1,
-) -> Tuple[Optional[TirPair], dict, str]:
-    """Run blastn self-vs-self with -strand minus at a given flank size.
-
-    Returns (best_tir, diag, note). Note is a short string describing what
-    happened when no TIR was selected.
-    """
-    rstart = max(1, cstart - flank)
-    rend   = min(clen, cend + flank)
-    region_seq = fa.fetch(contig, (rstart, rend))
-
-    region_fa = tmp / f"cluster_{ci:04d}_f{flank}.fa"
-    tab_out   = tmp / f"cluster_{ci:04d}_f{flank}.tsv"
-    with open(region_fa, "w") as fh:
-        fh.write(f">cluster_{ci:04d}_f{flank}\n")
-        for j in range(0, len(region_seq), 80):
-            fh.write(region_seq[j:j + 80] + "\n")
-
-    try:
-        run_blastn_self(region_fa, tab_out, cfg, threads=blastn_threads)
-    except subprocess.CalledProcessError as exc:
-        return None, dict(n_raw=0), f"blastn failed: {exc.stderr.strip()[:120]}"
-
-    pairs = parse_blastn_tabular(tab_out)
-    best, diag = select_best_tir(
-        pairs, region_offset=rstart,
-        hallmark_intervals=hallmark_intervals, cfg=cfg,
-        region_seq=region_seq,
-    )
-    if best is not None:
-        return best, diag, ""
-    if diag["n_raw"] == 0:
-        note = f"no inverted-repeat pairs in region (flank={flank:,} bp)"
-    else:
-        note = (
-            f"all TIR candidates filtered at flank={flank:,} bp "
-            f"({diag['n_raw']} raw, "
-            f"{diag['n_pass_insert']} insert, "
-            f"{diag['n_pass_len']} len, "
-            f"{diag['n_pass_id']} id, "
-            f"{diag['n_pass_complexity']} complexity, "
-            f"{diag['n_pass_bracket']} bracket); "
-            f"best near-miss: {diag['best_near_miss']}"
-        )
-    return None, diag, note
-
 def extend_tirless_boundaries(
     contig_orfs: List[Orf],
     cluster_start: int,
@@ -946,7 +907,8 @@ def extend_tirless_boundaries(
     cfg: dict,
 ) -> Tuple[int, int, dict]:
     """Walk the rolling viral score outward from a seed cluster to find GEVE boundaries."""
-    threshold = cfg.get("extend_threshold", 0.0)
+    threshold       = cfg.get("extend_threshold", -0.5)
+    start_threshold = cfg.get("extend_start_threshold", 0.0)
     max_bp    = cfg.get("extend_max_bp", 200_000)
     max_drops = cfg.get("extend_max_drops", 2)
     max_span  = cfg.get("max_cluster_span", 2_000_000)
@@ -955,7 +917,7 @@ def extend_tirless_boundaries(
         applied=False,
         n_left_added=0, n_right_added=0,
         extended_left_bp=0, extended_right_bp=0,
-        threshold=threshold, max_bp=max_bp,
+        threshold=threshold, start_threshold=start_threshold, max_bp=max_bp,
         stop_left="not_started", stop_right="not_started",
     )
 
@@ -973,53 +935,62 @@ def extend_tirless_boundaries(
     if left_idx is None or right_idx is None:
         return cluster_start, cluster_end, diag
 
+    edge_left_score  = rolling_by_orf.get(sorted_orfs[left_idx].orf_id,  0.0)
+    edge_right_score = rolling_by_orf.get(sorted_orfs[right_idx].orf_id, 0.0)
+
     new_start = cluster_start
-    drops = 0
-    i = left_idx - 1
-    diag["stop_left"] = "contig_edge"
-    while i >= 0:
-        o = sorted_orfs[i]
-        if cluster_start - o.start > max_bp:
-            diag["stop_left"] = "extend_max_bp"
-            break
-        if (cluster_end - o.start + 1) > max_span:
-            diag["stop_left"] = "max_cluster_span"
-            break
-        score = rolling_by_orf.get(o.orf_id, 0.0)
-        if score > threshold:
-            new_start = o.start
-            drops = 0
-            diag["n_left_added"] += 1
-        else:
-            drops += 1
-            if drops >= max_drops:
-                diag["stop_left"] = "below_threshold"
+    if edge_left_score <= start_threshold:
+        diag["stop_left"] = "edge_below_start_threshold"
+    else:
+        drops = 0
+        i = left_idx - 1
+        diag["stop_left"] = "contig_edge"
+        while i >= 0:
+            o = sorted_orfs[i]
+            if cluster_start - o.start > max_bp:
+                diag["stop_left"] = "extend_max_bp"
                 break
-        i -= 1
+            if (cluster_end - o.start + 1) > max_span:
+                diag["stop_left"] = "max_cluster_span"
+                break
+            score = rolling_by_orf.get(o.orf_id, 0.0)
+            if score > threshold:
+                new_start = o.start
+                drops = 0
+                diag["n_left_added"] += 1
+            else:
+                drops += 1
+                if drops >= max_drops:
+                    diag["stop_left"] = "below_threshold"
+                    break
+            i -= 1
 
     new_end = cluster_end
-    drops = 0
-    i = right_idx + 1
-    diag["stop_right"] = "contig_edge"
-    while i < len(sorted_orfs):
-        o = sorted_orfs[i]
-        if o.end - cluster_end > max_bp:
-            diag["stop_right"] = "extend_max_bp"
-            break
-        if (o.end - new_start + 1) > max_span:
-            diag["stop_right"] = "max_cluster_span"
-            break
-        score = rolling_by_orf.get(o.orf_id, 0.0)
-        if score > threshold:
-            new_end = o.end
-            drops = 0
-            diag["n_right_added"] += 1
-        else:
-            drops += 1
-            if drops >= max_drops:
-                diag["stop_right"] = "below_threshold"
+    if edge_right_score <= start_threshold:
+        diag["stop_right"] = "edge_below_start_threshold"
+    else:
+        drops = 0
+        i = right_idx + 1
+        diag["stop_right"] = "contig_edge"
+        while i < len(sorted_orfs):
+            o = sorted_orfs[i]
+            if o.end - cluster_end > max_bp:
+                diag["stop_right"] = "extend_max_bp"
                 break
-        i += 1
+            if (o.end - new_start + 1) > max_span:
+                diag["stop_right"] = "max_cluster_span"
+                break
+            score = rolling_by_orf.get(o.orf_id, 0.0)
+            if score > threshold:
+                new_end = o.end
+                drops = 0
+                diag["n_right_added"] += 1
+            else:
+                drops += 1
+                if drops >= max_drops:
+                    diag["stop_right"] = "below_threshold"
+                    break
+            i += 1
 
     diag["extended_left_bp"]  = cluster_start - new_start
     diag["extended_right_bp"] = new_end - cluster_end
@@ -1082,33 +1053,74 @@ def _process_cluster(task: dict) -> dict:
     flank_used = 0
     flanks_tried: List[int] = []
 
-    flank     = cfg["tir_flank_start"]
-    flank_max = cfg["tir_flank_max"]
-    step      = cfg["tir_flank_step"]
+    flank_start = cfg["tir_flank_start"]
+    flank_max   = cfg["tir_flank_max"]
+    step        = cfg["tir_flank_step"]
 
     with tempfile.TemporaryDirectory(prefix="findGEVE_") as tmp:
         tmp = Path(tmp)
+        rstart_max = max(1, pre_start - flank_max)
+        rend_max   = min(clen, pre_end + flank_max)
+        region_seq_max = fa.fetch(contig, (rstart_max, rend_max))
+
+        region_fa = tmp / f"cluster_{ci:04d}.fa"
+        tab_out   = tmp / f"cluster_{ci:04d}.tsv"
+        with open(region_fa, "w") as fh:
+            fh.write(f">cluster_{ci:04d}\n")
+            for j in range(0, len(region_seq_max), 80):
+                fh.write(region_seq_max[j:j + 80] + "\n")
+
+        try:
+            run_blastn_self(region_fa, tab_out, cfg, threads=blastn_threads)
+        except FileNotFoundError:
+            return dict(
+                status="fatal", cluster_index=ci, contig=contig,
+                message="blastn not found in PATH inside worker",
+            )
+        except subprocess.CalledProcessError as exc:
+            err = (exc.stderr or "").strip()[:120]
+            log_msgs.append(("info",
+                f"Cluster {ci} ({contig}:{cstart:,}-{cend:,}): "
+                f"blastn failed: {err}; retaining TIR-less "
+                f"(boundary={pre_start:,}-{pre_end:,})"
+            ))
+            all_pairs: List[TirPair] = []
+        else:
+            all_pairs = parse_blastn_tabular(tab_out)
+
         last_note = ""
+        flank = flank_start
         while flank <= flank_max:
             flanks_tried.append(flank)
-            try:
-                tir, diag, note = _try_blastn_at_flank(
-                    contig, pre_start, pre_end, clen, flank, cfg, fa,
-                    hallmark_intervals, tmp, ci,
-                    blastn_threads=blastn_threads,
-                )
-            except FileNotFoundError:
-                return dict(
-                    status="fatal", cluster_index=ci, contig=contig,
-                    message="blastn not found in PATH inside worker",
-                )
-            if tir is not None:
-                best_tir   = tir
-                flank_used = flank
-                break
-            last_note = note
             rstart = max(1, pre_start - flank)
             rend   = min(clen, pre_end + flank)
+            visible_pairs = [
+                p for p in all_pairs
+                if (p.left_start  + rstart_max - 1) >= rstart
+                and (p.right_end + rstart_max - 1) <= rend
+            ]
+            best, diag = select_best_tir(
+                visible_pairs, region_offset=rstart_max,
+                hallmark_intervals=hallmark_intervals, cfg=cfg,
+                region_seq=region_seq_max,
+            )
+            if best is not None:
+                best_tir   = best
+                flank_used = flank
+                break
+            if diag["n_raw"] == 0:
+                last_note = f"no inverted-repeat pairs in region (flank={flank:,} bp)"
+            else:
+                last_note = (
+                    f"all TIR candidates filtered at flank={flank:,} bp "
+                    f"({diag['n_raw']} raw, "
+                    f"{diag['n_pass_insert']} insert, "
+                    f"{diag['n_pass_len']} len, "
+                    f"{diag['n_pass_id']} id, "
+                    f"{diag['n_pass_complexity']} complexity, "
+                    f"{diag['n_pass_bracket']} bracket); "
+                    f"best near-miss: {diag['best_near_miss']}"
+                )
             if rstart == 1 and rend == clen:
                 break
             flank += step
@@ -1179,6 +1191,18 @@ def _process_cluster(task: dict) -> dict:
 
     # GC content of the GEVE
     geve_seq = fa.fetch(contig, (geve_start, geve_end))
+    n_count = geve_seq.upper().count("N")
+    n_fraction = n_count / len(geve_seq) if geve_seq else 0.0
+    n_max = cfg.get("n_max_fraction", 0.05)
+    if n_fraction > n_max:
+        return dict(
+            status="skip", cluster_index=ci, contig=contig, log_msgs=log_msgs,
+            message=(
+                f"Cluster {ci} ({contig}:{cstart:,}-{cend:,}): "
+                f"N fraction {n_fraction:.2%} > {n_max:.0%} "
+                f"(likely contig-junction artifact); discarded"
+            ),
+        )
     gc_geve  = gc_of_seq(geve_seq)
 
     geve_obj = dict(
@@ -1222,6 +1246,24 @@ def coding_density(orfs: List[Orf], span_start: int, span_end: int) -> float:
     return round(pct, 3)
 
 # Output writers
+def _get_tool_versions() -> Dict[str, str]:
+    versions: Dict[str, str] = {}
+    for pkg in ("pyrodigal-gv", "pyhmmer", "pyfastx", "numpy", "pandas"):
+        try:
+            versions[pkg] = _pkg_version(pkg)
+        except PackageNotFoundError:
+            versions[pkg] = "unknown"
+    try:
+        out = subprocess.run(
+            ["blastn", "-version"], capture_output=True, text=True, check=False,
+        )
+        first = (out.stdout or out.stderr).strip().splitlines()
+        versions["blastn"] = first[0] if first else "unknown"
+    except FileNotFoundError:
+        versions["blastn"] = "not_found"
+    versions["python"] = sys.version.split()[0]
+    return versions
+
 def _tsd_fields(tsd: Optional[Tsd]) -> dict:
     if tsd is None:
         return dict(
@@ -1538,7 +1580,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("genome", type=Path)
     p.add_argument("-db", "--db", type=Path, required=True)
     p.add_argument("--prefix", type=str, required=True)
-    p.add_argument("--outdir", type=Path,
+    p.add_argument("-o", "--outdir", type=Path,
                    default=Path(f"Result_{datetime.now().strftime('%Y%m%d')}"))
     p.add_argument("-t", "--threads", type=int, default=4)
     p.add_argument("-e", "--evalue", type=float, default=DEFAULTS["evalue"])
@@ -1546,11 +1588,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--min-hallmark-type", type=int, default=DEFAULTS["min_hallmarks"])
     p.add_argument("--blastn-threads",       type=int,   default=1)
     p.add_argument("--min-contig",           type=int,   default=DEFAULTS["min_contig"])
-    p.add_argument("--min-geve-length",      type=int,   default=DEFAULTS["min_geve_length"])
-    p.add_argument("--no-extend-tirless",    action="store_true")
-    p.add_argument("--extend-threshold",     type=float, default=DEFAULTS["extend_threshold"])
-    p.add_argument("--extend-max-bp",        type=int,   default=DEFAULTS["extend_max_bp"])
-    p.add_argument("--tir-bracket-fraction", type=float, default=DEFAULTS["tir_bracket_fraction"])
 
     return p.parse_args(argv)
 
@@ -1570,12 +1607,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     cfg = dict(DEFAULTS)
     cfg["min_contig"]           = args.min_contig
-    cfg["min_geve_length"]      = args.min_geve_length
+    cfg["min_geve_length"]      = args.min_contig
     cfg["min_hallmarks"]        = args.min_hallmark_type
-    cfg["extend_tirless"]       = not args.no_extend_tirless
-    cfg["extend_threshold"]     = args.extend_threshold
-    cfg["extend_max_bp"]        = args.extend_max_bp
-    cfg["tir_bracket_fraction"] = args.tir_bracket_fraction
     cfg["evalue"]               = args.evalue
 
     args.outdir.mkdir(parents=True, exist_ok=True)
@@ -1609,7 +1642,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     if cfg["extend_tirless"]:
         _LOG.info(
             f"TIR-less extension | enabled | "
-            f"threshold={cfg['extend_threshold']} | "
+            f"start_threshold={cfg['extend_start_threshold']} | "
+            f"continue_threshold={cfg['extend_threshold']} | "
             f"max={cfg['extend_max_bp']:,} bp/side | "
             f"max_drops={cfg['extend_max_drops']}"
         )
@@ -1641,8 +1675,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         return 2
 
+    versions = _get_tool_versions()
+    _LOG.info("Tool versions | " + " | ".join(f"{k}={v}" for k, v in versions.items()))
+    _LOG.info(f"Command line | {' '.join(sys.argv)}")
+
     # Stage 1: ORF prediction
     orfs_by_id, contig_lengths = predict_orfs(args.genome, cfg["min_contig"], args.threads)
+    fa = pyfastx.Fasta(str(args.genome), build_index=True, uppercase=True)
 
     # Build a contig -> ORF list once and reuse throughout
     orfs_by_contig: Dict[str, List[Orf]] = {}
@@ -1670,39 +1709,28 @@ def main(argv: Optional[List[str]] = None) -> int:
     if run_pfam:
         scan_pfam(gvog_targets, pfam_hmm, cfg["evalue"], args.threads)
 
-    # Finalize net_score on every ORF (virbit - pfambit)
+    # Asymmetric Pfam penalty: virbit - max(0, pfambit - virbit)
     for o in orfs_by_id.values():
-        o.net_score = o.virbit - o.pfambit
+        o.net_score = o.virbit - max(0.0, o.pfambit - o.virbit)
 
-    # Stage 3: seeding (with same-contig cluster merging)
+    # Rolling viral score (computed before seeding for the gap merge check)
+    rolling_by_orf_per_contig = compute_rolling_scores(
+        orfs_by_contig, cfg["rolling_window"], hallmark_contigs,
+    )
+
+    # Stage 3: seeding (with same-contig cluster merging + host-territory gap check)
     clusters = find_seed_clusters(
         orfs_by_contig,
         cfg["seed_window"],
         cfg["min_hallmarks"],
         cfg["cluster_merge_gap"],
         cfg["max_cluster_span"],
+        rolling_by_orf_per_contig=rolling_by_orf_per_contig,
     )
     if not clusters:
         _LOG.warning("No clusters passed hallmark-density criterion. No GEVE candidates.")
         _write_empty_outputs(args.outdir, args.prefix, args.genome, t0)
         return 0
-
-    # Stage 4: rolling viral score per candidate contig
-    candidate_contigs = {cl["contig"] for cl in clusters}
-    score_df_by_contig = compute_rolling_scores(
-        orfs_by_contig, cfg["rolling_window"], candidate_contigs
-    )
-
-    # Stages 5-7: per-cluster parallel worker (TIR, TSD, GC)
-    fa = pyfastx.Fasta(str(args.genome), build_index=True, uppercase=True)
-
-    # Per-contig rolling-score lookup, used by TIR-less boundary extension.
-    rolling_by_orf_per_contig: Dict[str, Dict[str, float]] = {}
-    for contig, df in score_df_by_contig.items():
-        if "rolling" in df.columns:
-            rolling_by_orf_per_contig[contig] = dict(
-                zip(df["orf_id"], df["rolling"].astype(float))
-            )
 
     tasks = []
     for ci, cl in enumerate(clusters, start=1):
