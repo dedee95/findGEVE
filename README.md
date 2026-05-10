@@ -69,9 +69,10 @@ conda install bioconda::blast
 This tool use 3 different HMM database, including NCLDV hallmark genes, GVOG, and Pfam.  The `database` directory (`-db/--db`) must contain:
 
 ```
-NCLDV_markers.hmm  # required
-gvog.hmm           # required
-Pfam-A.hmm         # optional (BETTER PROVIDE IT)
+NCLDV_markers.hmm        # required
+gvog.complete.hmm        # required
+gvog.complete.annot.tsv* # required for functional annotation
+Pfam-A.hmm               # optional (BETTER PROVIDE IT)
 ```
 
 1. The NCLDV_markers.hmm file is already available in this repository at `database/NCLDV_markers.hmm`. Many thanks to [Dr. Frank Aylward](https://scholar.google.com/citations?user=JLV6g2AAAAAJ&hl=en) and his team, who created this database and make it open souce. 
