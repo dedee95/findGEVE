@@ -46,9 +46,9 @@ This tool is fully written in Python and mostly uses third-party Python packages
 ### 1.1 Third party Python packages:
 - `numpy`
 - `pandas`
-- `pyfastx`
-- `pyhmmer`
-- `pyrodigal-gv`
+- `pyfastx v2.3.0`
+- `pyhmmer v3.3.2`
+- `pyrodigal-gv v0.3.2`
 
 ```
 # install using pip (RECOMENDED)
