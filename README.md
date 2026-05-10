@@ -44,11 +44,11 @@ Here, I present **findGEVE** for end-to-end GEVE identification, with output rea
 ## 1. Requirements
 This tool is fully written in Python and mostly uses third-party Python packages that can be installed using pip. `findGEVE.py` is compatible with `Python v3.8` or higher. Make sure your already have python installed in your system.
 ### 1.1 Third party Python packages:
-- `numpy`
-- `pandas`
-- `pyfastx v2.3.0`
-- `pyhmmer v3.3.2`
-- `pyrodigal-gv v0.3.2`
+- `numpy` v1.24 or hinger
+- `pandas`  v2.0 or hinger
+- `pyfastx` v2.3.0
+- `pyhmmer` v3.3.2
+- `pyrodigal-gv` v0.3.2
 
 ```
 # install using pip (RECOMENDED)
