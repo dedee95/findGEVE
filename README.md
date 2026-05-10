@@ -106,17 +106,19 @@ Usage: findGEVE.py -db <directory> --prefix <prefix> <genome.fa> [OPTIONS]
 
 Mandatory:
   -db, --db            HMM database directory (must contain NCLDV_markers.hmm
-                       and gvog.hmm; Pfam-A.hmm is optional)
+                       and gvog.complete.hmm; Pfam-A.hmm is optional)
   --prefix             Output prefix for GEVE IDs and file names
   genome               Input genome assembly FASTA (gzip is acceptable)
 
 Optional:
-  --outdir             Output directory                              [default: ./Result_<YYYYMMDD>]
+  -o, --outdir         Output directory                              [default: ./Result_<YYYYMMDD>]
   -t, --threads        CPU threads for ORF prediction and HMM search [default: 4]
   -e, --evalue         E-value cutoff for HMM searches               [default: 1e-5]
   --blastn-jobs        Parallel TIR-detection workers                [default: --threads]
   --min-hallmark-type  Minimum number of distinct hallmark types
                        required per cluster                          [default: 2]
+  --min-contig         Minimum contig length to scan for GEVE 
+                       detection                                     [default: 50000]
   -h, --help           Show this help and exit
 ```
 
@@ -142,6 +144,7 @@ Retained GEVE are sorted by contig and position, assigned IDs, and store to outp
 ├── Chlamydomonas.markerout     # Hallmark genes, TIR, and TSD coordinate
 ├── Chlamydomonas.geve.gff      # Annotated GEVE relative to host genome
 ├── Chlamydomonas.geve.cds      # Coding sequence for each retained GEVE
+├── Chlamidomonas.geve.func.tsv # Functional annotation for each retained GEVE proteins
 ├── Chlamydomonas.geve.pep      # Protein sequence for each retained GEVE
 └── hallmark/                   # Per-hallmark type protein sequence (suitable for phylogenetic)
 	├── Chlamydomonas.d5.pep  
@@ -177,7 +180,7 @@ Finds genomic regions containing multiple distinct viral hallmark types within a
 ![Seed candidate GEVE 1](docs/3.seed_candidate_1.png)
 **Merging process**
 
-Many anchors produce overlapping windows. Any two clusters on the same contig whose spans overlap are merge together. After this pass, every cluster on a contig is non-overlapping. If there any two adjacent clusters it will be merge if their inter-cluster gap is `≤ 100 kb` and the merged span would not exceed `2 mb`.
+Many anchors produce overlapping windows. Any two clusters on the same contig whose spans overlap are merge together. After this pass, every cluster on a contig is non-overlapping. If there any two adjacent clusters it will be merge if their inter-cluster gap is `≤ 50 kb` and the merged span would not exceed `2 mb`.
 
 Example case for two cluster in the same contig are merged: 
 ![Seed candidate GEVE 2](docs/3.seed_candidate_2.png)
@@ -223,9 +226,10 @@ A TIR candidate must pass four criteria:
 | `insert`  | 30,000 bp ≤ insert_size ≤ 1,500,000 bp                 |
 | `len`     | 10 bp ≤ tir_length ≤ 10,000 bp                         |
 | `id`      | tir_identity ≥ 65 %                                    |
-| `bracket` | encloses ≥ ⌈0.5 × total_hallmarks⌉ hallmark ORFs (≥ 1) |
+| `bracket` | encloses all detected hallmarks                        |
 
-The bracket test is the biological keystone: *a real GEVE TIR brackets the viral content*. Inverted repeats that miss the hallmarks are accepted as viral-region neighbors, not as the integration's boundaries.
+Retained TIR sequence will be real TIR sequence, not just low repeat complexity like mono- or dinucleotide repeat.
+
 ### 4.6 TSD identification algorithm
 Many GEVE duplicate a short host sequence (TSD) on both flanks of the insertion. So, if TIR pair were found, then check the target site duplication (TSD) in TIR flank region.
 
