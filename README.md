@@ -228,7 +228,7 @@ A TIR candidate must pass four criteria:
 | `id`      | tir_identity ≥ 65 %                                    |
 | `bracket` | encloses all detected hallmarks                        |
 
-Retained TIR sequence will be real TIR sequence, not just low repeat complexity like mono- or dinucleotide repeat.
+Retained TIR sequence will be real TIR sequence, not just low complexity repeat like mono- or dinucleotide repeat.
 
 ### 4.6 TSD identification algorithm
 Many GEVE duplicate a short host sequence (TSD) on both flanks of the insertion. So, if TIR pair were found, then check the target site duplication (TSD) in TIR flank region.
