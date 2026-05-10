@@ -71,7 +71,7 @@ This tool use 3 different HMM database, including NCLDV hallmark genes, GVOG, an
 ```
 NCLDV_markers.hmm        # required
 gvog.complete.hmm        # required
-gvog.complete.annot.tsv* # required for functional annotation
+gvog.complete.annot.tsv  # required for functional annotation
 Pfam-A.hmm               # optional (BETTER PROVIDE IT)
 ```
 
