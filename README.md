@@ -139,14 +139,14 @@ The input genome can be plain FASTA or gzip-compressed FASTA.
 Retained GEVE are sorted by contig and position, assigned IDs, and store to output directory.
 
 ```
-├── Chlamydomonas.geve.fna      # Retained GEVE sequence
-├── Chlamydomonas.summary.tsv   # Per-GEVE summary table
-├── Chlamydomonas.markerout     # Hallmark genes, TIR, and TSD coordinate
-├── Chlamydomonas.geve.gff      # Annotated GEVE relative to host genome
-├── Chlamydomonas.geve.cds      # Coding sequence for each retained GEVE
-├── Chlamidomonas.geve.func.tsv # Functional annotation for each retained GEVE proteins
-├── Chlamydomonas.geve.pep      # Protein sequence for each retained GEVE
-└── hallmark/                   # Per-hallmark type protein sequence (suitable for phylogenetic)
+├── Chlamydomonas.geve.fna        # Retained GEVE sequence
+├── Chlamydomonas.summary.tsv     # Per-GEVE summary table
+├── Chlamydomonas.markerout       # Hallmark genes, TIR, and TSD coordinate
+├── Chlamydomonas.geve.gff        # Annotated GEVE relative to host genome
+├── Chlamydomonas.geve.cds        # Coding sequence for each retained GEVE
+├── Chlamidomonas.geve.func.tsv   # Functional annotation for each retained GEVE proteins
+├── Chlamydomonas.geve.pep        # Protein sequence for each retained GEVE
+└── hallmark/                     # Per-hallmark type protein sequence (suitable for phylogenetic)
 	├── Chlamydomonas.d5.pep  
 	├── Chlamydomonas.rnapl.pep  
 	├── Chlamydomonas.polb.pep  
