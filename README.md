@@ -110,15 +110,19 @@ Mandatory:
   --prefix             Output prefix for GEVE IDs and file names
   genome               Input genome assembly FASTA (gzip is acceptable)
 
-Optional:
+Optionals:
   -o, --outdir         Output directory                              [default: ./Result_<YYYYMMDD>]
   -t, --threads        CPU threads for ORF prediction and HMM search [default: 4]
   -e, --evalue         E-value cutoff for HMM searches               [default: 1e-5]
   --blastn-jobs        Parallel TIR-detection workers                [default: --threads]
-  --min-hallmark-type  Minimum number of distinct hallmark types
-                       required per cluster                          [default: 2]
+  -m, --min-hallmark-type
+                       Minimum number of distinct hallmark types
+                       required in the final retained GEVE
+                       (seeding always uses >= 1)                    [default: 2]
   --min-contig         Minimum contig length to scan for GEVE 
-                       detection                                     [default: 50000]
+                       detection                                     [default: 50_000]
+  --cluster-merge-gap  Maximum gap (bp) between same-contig clusters
+                       eligible for merging                          [default: 100_000]
   -h, --help           Show this help and exit
 ```
 
