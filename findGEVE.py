@@ -38,15 +38,19 @@ Mandatory:
   --prefix             Output prefix for GEVE IDs and file names
   genome               Input genome assembly FASTA (gzip is acceptable)
 
-Optional:
+Optionals:
   -o, --outdir         Output directory                              [default: ./Result_<YYYYMMDD>]
   -t, --threads        CPU threads for ORF prediction and HMM search [default: 4]
   -e, --evalue         E-value cutoff for HMM searches               [default: 1e-5]
   --blastn-jobs        Parallel TIR-detection workers                [default: --threads]
-  --min-hallmark-type  Minimum number of distinct hallmark types
-                       required per cluster                          [default: 2]
+  -m, --min-hallmark-type
+                       Minimum number of distinct hallmark types
+                       required in the final retained GEVE
+                       (seeding always uses >= 1)                    [default: 2]
   --min-contig         Minimum contig length to scan for GEVE 
-                       detection                                     [default: 50000]
+                       detection                                     [default: 50_000]
+  --cluster-merge-gap  Maximum gap (bp) between same-contig clusters
+                       eligible for merging                          [default: 100_000]
   -h, --help           Show this help and exit
 """
 
@@ -54,19 +58,21 @@ USAGE_TEXT = "Usage: findGEVE.py -db <DB directory> --prefix <prefix> <genome.fa
 
 # tunable parameters.
 DEFAULTS = dict(
-    min_contig          = 50_000,    
-    min_geve_length     = 50_000,   
-    min_hallmarks       = 2,         
-    seed_window         = 300_000,   
-    cluster_merge_gap   = 50_000,
+    min_contig          = 50_000,
+    min_geve_length     = 50_000,
+    min_hallmarks_seed  = 1,
+    min_hallmarks       = 2,
+    seed_window         = 300_000,
+    cluster_merge_gap   = 100_000,
     max_cluster_span    = 2_000_000,
+    host_territory_fraction = 0.7,
     rolling_window      = 15,
     tir_flank_start     = 100_000,
     tir_flank_step      = 100_000,
     tir_flank_max       = 200_000,
     tir_min_insert      = 30_000,  
     tir_max_insert      = 1_500_000,
-    tir_min_len         = 10,    
+    tir_min_len         = 10,
     tir_max_len         = 10_000,
     tir_min_id          = 65.0, 
     tir_bracket_fraction= 1.0,
@@ -85,11 +91,11 @@ DEFAULTS = dict(
     tsd_max             = 12,
     tsd_max_slide       = 2,
     tsd_search_window   = 60,     
-    extend_tirless      = True,      
-    extend_threshold    = -0.5,
+    extend_tirless      = True,
+    extend_threshold    = -1.0,
     extend_start_threshold = 0.0,
-    extend_max_bp       = 200_000,   
-    extend_max_drops    = 2,
+    extend_max_bp       = 200_000,
+    extend_max_drops    = 5,
     n_max_fraction      = 0.05,
     evalue              = 1e-5,
     hallmark_score_cutoffs = {
@@ -302,8 +308,6 @@ def scan_hallmarks(
     score_cutoffs: Optional[Dict[str, float]] = None,
 ) -> Dict[str, List[str]]:
     """Scan all proteins against NCLDV_markers.hmm.
-
-    Annotates Orf.hallmark in place and returns contig -> [hallmark_name, ...].
     """
     alphabet = pyhmmer.easel.Alphabet.amino()
     seqs = _digital_seqs(orfs_by_id.values(), alphabet)
@@ -424,16 +428,18 @@ def _gap_is_host_territory(
     curr_start: int,
     contig_orfs: List[Orf],
     rolling: Dict[str, float],
+    host_fraction: float = 0.7,
 ) -> bool:
-    """Gap looks like host: no hallmark/GVOG hits AND rolling score crosses zero."""
+    """Gap is host territory when no hallmark/GVOG hits and a majority of gap ORFs
+    have negative rolling viral score (fraction > host_fraction)."""
     gap_orfs = [o for o in contig_orfs
                 if o.start > prev_end and o.end < curr_start]
     if not gap_orfs:
         return False
     if any(o.hallmark is not None or o.gvog is not None for o in gap_orfs):
         return False
-    return any(rolling.get(o.orf_id, 0.0) < 0 for o in gap_orfs)
-
+    n_neg = sum(1 for o in gap_orfs if rolling.get(o.orf_id, 0.0) < 0)
+    return (n_neg / len(gap_orfs)) > host_fraction
 
 def find_seed_clusters(
     orfs_by_contig: Dict[str, List[Orf]],
@@ -442,6 +448,7 @@ def find_seed_clusters(
     cluster_merge_gap: int,
     max_cluster_span: int,
     rolling_by_orf_per_contig: Optional[Dict[str, Dict[str, float]]] = None,
+    host_fraction: float = 0.7,
 ) -> List[dict]:
     """Identify candidate GEVE clusters by sliding window over hallmark ORFs."""
     half = window_size // 2
@@ -495,7 +502,8 @@ def find_seed_clusters(
                 contig_orfs = orfs_by_contig.get(c["contig"], [])
                 rolling = rolling_by_orf_per_contig.get(c["contig"], {})
                 if not _gap_is_host_territory(
-                        prev["cluster_end"], c["cluster_start"], contig_orfs, rolling):
+                        prev["cluster_end"], c["cluster_start"], contig_orfs, rolling,
+                        host_fraction):
                     prev["cluster_end"] = c["cluster_end"]
                     prev["orf_ids"]   = sorted(set(prev["orf_ids"])   | set(c["orf_ids"]))
                     prev["hallmarks"] = sorted(set(prev["hallmarks"]) | set(c["hallmarks"]))
@@ -537,7 +545,6 @@ def compute_rolling_scores(
         rolling = np.where(window_sizes >= 3, window_sums / np.maximum(window_sizes, 1), 0.0)
         result[contig] = {orfs[i].orf_id: float(rolling[i]) for i in range(n)}
     return result
-
 
 # Stage 5: TIR detection (blastn self-vs-self, -strand minus)
 _BLASTN_OUTFMT = "6 qstart qend sstart send length nident pident gaps evalue bitscore"
@@ -658,7 +665,7 @@ def _dinucleotide_entropy(seq: str) -> float:
     return entropy
 
 def _max_kmer_fraction(seq: str, k: int) -> float:
-    """Maximum fraction of any single k-mer across all phase offsets (non-overlapping tiling)."""
+    """Maximum fraction of any single k-mer across all phase offsets."""
     arr = seq.upper().encode("ascii")
     n = len(arr)
     if n < k:
@@ -706,8 +713,6 @@ def _tir_is_low_complexity(
     max_tandem_period: int,
 ) -> Tuple[bool, str]:
     """Reject TIRs that are simple repeats or low-complexity sequences.
-
-    Returns (is_low_complexity, reason).
     """
     if not seq:
         return True, "empty TIR sequence"
@@ -858,9 +863,6 @@ def find_tsd(
     max_slide: int,
 ) -> Optional[Tsd]:
     """Search for Target Site Duplications flanking the TIR boundaries.
-
-    Mismatch tolerance: k<=5 -> 0 mm; k<=8 -> 1 mm; k>=9 -> 2 mm.
-    Slide tolerance: up to max_slide bases to absorb small TIR-boundary errors.
     """
     left  = left_flank.upper()
     right = right_flank.upper()
@@ -1001,10 +1003,86 @@ def extend_tirless_boundaries(
     diag["applied"] = (new_start < cluster_start) or (new_end > cluster_end)
     return new_start, new_end, diag
 
+def prescan_and_merge_clusters(
+    clusters: List[dict],
+    orfs_by_contig: Dict[str, List[Orf]],
+    rolling_by_orf_per_contig: Dict[str, Dict[str, float]],
+    cfg: dict,
+) -> List[dict]:
+    """Run viral-score pre-scan on each seed cluster, then merge same-contig
+    clusters whose extended boundaries overlap or are within cluster_merge_gap.
+    """
+    extend    = cfg.get("extend_tirless", True)
+    merge_gap = cfg.get("cluster_merge_gap", 50_000)
+    max_span  = cfg.get("max_cluster_span", 2_000_000)
+    host_fraction = cfg.get("host_territory_fraction", 0.7)
+
+    extended: List[dict] = []
+    for cl in clusters:
+        contig      = cl["contig"]
+        contig_orfs = orfs_by_contig.get(contig, [])
+        rolling     = rolling_by_orf_per_contig.get(contig, {})
+        if extend:
+            pre_s, pre_e, diag = extend_tirless_boundaries(
+                contig_orfs, cl["cluster_start"], cl["cluster_end"], rolling, cfg,
+            )
+            if diag.get("applied"):
+                _LOG.info(
+                    f"Pre-scan ({contig}:{cl['cluster_start']:,}-{cl['cluster_end']:,}): "
+                    f"seed -> {pre_s:,}-{pre_e:,} "
+                    f"(+{diag['extended_left_bp']:,} bp / "
+                    f"+{diag['n_left_added']} ORFs left; "
+                    f"+{diag['extended_right_bp']:,} bp / "
+                    f"+{diag['n_right_added']} ORFs right; "
+                    f"stop_left={diag['stop_left']}, stop_right={diag['stop_right']})"
+                )
+        else:
+            pre_s, pre_e, diag = cl["cluster_start"], cl["cluster_end"], None
+        out = dict(cl)
+        out["pre_start"]    = pre_s
+        out["pre_end"]      = pre_e
+        out["prescan_diag"] = diag
+        extended.append(out)
+
+    extended.sort(key=lambda c: (c["contig"], c["pre_start"]))
+    merged: List[dict] = []
+    n_merged = 0
+    n_refused = 0
+    for c in extended:
+        if merged and merged[-1]["contig"] == c["contig"]:
+            prev = merged[-1]
+            gap = c["pre_start"] - prev["pre_end"] - 1
+            new_span = max(prev["pre_end"], c["pre_end"]) - prev["pre_start"] + 1
+            if gap <= merge_gap and new_span <= max_span:
+                if gap <= 0 or not _gap_is_host_territory(
+                        prev["pre_end"], c["pre_start"],
+                        orfs_by_contig.get(c["contig"], []),
+                        rolling_by_orf_per_contig.get(c["contig"], {}),
+                        host_fraction):
+                    prev["pre_end"]       = max(prev["pre_end"], c["pre_end"])
+                    prev["cluster_start"] = min(prev["cluster_start"], c["cluster_start"])
+                    prev["cluster_end"]   = max(prev["cluster_end"], c["cluster_end"])
+                    prev["orf_ids"]   = sorted(set(prev["orf_ids"])   | set(c["orf_ids"]))
+                    prev["hallmarks"] = sorted(set(prev["hallmarks"]) | set(c["hallmarks"]))
+                    prev["prescan_diag"] = dict(prev.get("prescan_diag") or {})
+                    prev["prescan_diag"]["applied"] = True
+                    n_merged += 1
+                    continue
+                else:
+                    n_refused += 1
+        merged.append(dict(c))
+
+    _LOG.info(
+        f"Post-extension merge: {len(extended)} -> {len(merged)} cluster(s) "
+        f"({n_merged} merged within {merge_gap:,} bp; "
+        f"{n_refused} refused as host territory)"
+    )
+    return merged
 
 def _process_cluster(task: dict) -> dict:
     """Process one hallmark cluster end-to-end inside a worker process."""
     ci             = task["cluster_index"]
+    clabel         = task.get("cluster_label", ci)
     contig         = task["contig"]
     cstart         = task["cluster_start"]
     cend           = task["cluster_end"]
@@ -1012,39 +1090,14 @@ def _process_cluster(task: dict) -> dict:
     cfg            = task["cfg"]
     genome_path    = task["genome_path"]
     contig_orfs    = task["contig_orfs"]
-    rolling_by_orf: Dict[str, float] = task.get("rolling_by_orf", {})
     blastn_threads = int(task.get("blastn_threads", 1))
 
     log_msgs: List[Tuple[str, str]] = []
     fa = pyfastx.Fasta(str(genome_path), build_index=True, uppercase=True)
 
-    prescan_diag: Optional[dict] = None
-    if cfg.get("extend_tirless", True):
-        pre_start, pre_end, prescan_diag = extend_tirless_boundaries(
-            contig_orfs, cstart, cend, rolling_by_orf, cfg,
-        )
-        if prescan_diag.get("applied"):
-            log_msgs.append(("info",
-                f"Cluster {ci} ({contig}:{cstart:,}-{cend:,}): "
-                f"viral-score pre-scan: seed -> {pre_start:,}-{pre_end:,} "
-                f"(+{prescan_diag['extended_left_bp']:,} bp / "
-                f"+{prescan_diag['n_left_added']} ORFs left; "
-                f"+{prescan_diag['extended_right_bp']:,} bp / "
-                f"+{prescan_diag['n_right_added']} ORFs right; "
-                f"stop_left={prescan_diag['stop_left']}, "
-                f"stop_right={prescan_diag['stop_right']})"
-            ))
-        else:
-            log_msgs.append(("info",
-                f"Cluster {ci} ({contig}:{cstart:,}-{cend:,}): "
-                f"viral-score pre-scan: no extension (seed boundaries retained)"
-            ))
-    else:
-        pre_start, pre_end = cstart, cend
-        log_msgs.append(("info",
-            f"Cluster {ci} ({contig}:{cstart:,}-{cend:,}): "
-            f"viral-score pre-scan skipped (--no-extend-tirless)"
-        ))
+    pre_start    = task["pre_start"]
+    pre_end      = task["pre_end"]
+    prescan_diag = task.get("prescan_diag")
 
     hallmark_intervals: List[Tuple[int, int]] = [
         (o.start, o.end)
@@ -1084,7 +1137,7 @@ def _process_cluster(task: dict) -> dict:
         except subprocess.CalledProcessError as exc:
             err = (exc.stderr or "").strip()[:120]
             log_msgs.append(("info",
-                f"Cluster {ci} ({contig}:{cstart:,}-{cend:,}): "
+                f"Cluster {clabel} ({contig}:{cstart:,}-{cend:,}): "
                 f"blastn failed: {err}; retaining TIR-less "
                 f"(boundary={pre_start:,}-{pre_end:,})"
             ))
@@ -1133,7 +1186,7 @@ def _process_cluster(task: dict) -> dict:
             tir_note = (last_note or "no TIR detected") + \
                        f"; flanks tried: {','.join(f'{f:,}' for f in flanks_tried)}"
             log_msgs.append(("info",
-                f"Cluster {ci} ({contig}:{cstart:,}-{cend:,}): "
+                f"Cluster {clabel} ({contig}:{cstart:,}-{cend:,}): "
                 f"{tir_note}; retaining TIR-less "
                 f"(boundary={pre_start:,}-{pre_end:,})"
             ))
@@ -1157,7 +1210,7 @@ def _process_cluster(task: dict) -> dict:
         return dict(
             status="skip", cluster_index=ci, contig=contig, log_msgs=log_msgs,
             message=(
-                f"Cluster {ci} ({contig}:{cstart:,}-{cend:,}): span "
+                f"Cluster {clabel} ({contig}:{cstart:,}-{cend:,}): span "
                 f"{geve_length:,} bp < {cfg['min_geve_length']:,} bp threshold; discarded"
             ),
         )
@@ -1167,18 +1220,17 @@ def _process_cluster(task: dict) -> dict:
     geve_orfs.sort(key=lambda x: x.start)
     hallmarks_in_geve = [o.hallmark for o in geve_orfs if o.hallmark]
     hallmark_types_in_geve = sorted(set(hallmarks_in_geve))
-    if len(hallmarks_in_geve) < cfg["min_hallmarks"]:
+    if not hallmark_types_in_geve:
         return dict(
             status="skip", cluster_index=ci, contig=contig, log_msgs=log_msgs,
             message=(
-                f"Cluster {ci} ({contig}:{cstart:,}-{cend:,}): "
-                f"post-boundary hallmark count ({len(hallmarks_in_geve)}) "
-                f"< min_hallmarks ({cfg['min_hallmarks']}); "
+                f"Cluster {clabel} ({contig}:{cstart:,}-{cend:,}): "
+                f"boundary excludes all hallmark ORFs; "
                 f"boundary_method={boundary_method}; discarded"
             ),
         )
 
-    # TSD detection (only when TIR boundaries are known)
+    # TSD detection
     tsd: Optional[Tsd] = None
     if best_tir is not None:
         win = cfg["tsd_search_window"]
@@ -1202,7 +1254,7 @@ def _process_cluster(task: dict) -> dict:
         return dict(
             status="skip", cluster_index=ci, contig=contig, log_msgs=log_msgs,
             message=(
-                f"Cluster {ci} ({contig}:{cstart:,}-{cend:,}): "
+                f"Cluster {clabel} ({contig}:{cstart:,}-{cend:,}): "
                 f"N fraction {n_fraction:.2%} > {n_max:.0%} "
                 f"(likely contig-junction artifact); discarded"
             ),
@@ -1248,6 +1300,241 @@ def coding_density(orfs: List[Orf], span_start: int, span_end: int) -> float:
     coding_bases = sum(e - s + 1 for s, e in merged)
     pct = min(100.0 * coding_bases / span, 100.0)
     return round(pct, 3)
+
+def _build_tirless_merge(
+    group: List[dict],
+    fa,
+    contig_orfs: List[Orf],
+) -> dict:
+    """Build a merged GEVE without TIR/TSD (fallback when re-detection fails)."""
+    group = sorted(group, key=lambda x: x["geve_start"])
+    contig    = group[0]["contig"]
+    new_start = group[0]["geve_start"]
+    new_end   = max(g["geve_end"] for g in group)
+    geve_orfs = sorted(
+        [o for o in contig_orfs
+         if o.start >= new_start and o.end <= new_end],
+        key=lambda x: x.start,
+    )
+    hms = [o.hallmark for o in geve_orfs if o.hallmark]
+    return dict(
+        geve_id="TBD",
+        contig=contig, contig_length=group[0]["contig_length"],
+        geve_start=new_start, geve_end=new_end,
+        geve_length=new_end - new_start + 1,
+        tir=None, tsd=None, orfs=geve_orfs,
+        n_hallmarks=len(hms),
+        hallmarks_present=sorted(set(hms)),
+        gc_geve=gc_of_seq(fa.fetch(contig, (new_start, new_end))),
+        has_tir=False, flank_used=0,
+        boundary_method="viral_score_boundary",
+    )
+
+def _redetect_on_merged_span(
+    group: List[dict],
+    fa,
+    contig_orfs: List[Orf],
+    contig_length: int,
+    cfg: dict,
+    genome_path: Path,
+    blastn_threads: int,
+) -> Tuple[dict, List[Tuple[str, str]]]:
+    """Re-run TIR/TSD detection on the combined span of merged GEVEs.
+    """
+    group = sorted(group, key=lambda x: x["geve_start"])
+    contig    = group[0]["contig"]
+    new_start = group[0]["geve_start"]
+    new_end   = max(g["geve_end"] for g in group)
+
+    task = dict(
+        cluster_index=0,
+        cluster_label="merge",
+        contig=contig,
+        cluster_start=new_start, cluster_end=new_end,
+        pre_start=new_start,     pre_end=new_end,
+        prescan_diag={"applied": True},
+        contig_length=contig_length,
+        cfg=cfg,
+        genome_path=str(genome_path),
+        contig_orfs=contig_orfs,
+        blastn_threads=blastn_threads,
+    )
+    result = _process_cluster(task)
+    log_msgs = result.get("log_msgs", []) or []
+    if result.get("status") == "ok":
+        return result["geve"], log_msgs
+    return _build_tirless_merge(group, fa, contig_orfs), log_msgs
+
+
+def _merge_adjacent_geves(
+    geves: List[dict],
+    fa,
+    orfs_by_contig: Dict[str, List[Orf]],
+    rolling_by_orf_per_contig: Dict[str, Dict[str, float]],
+    cfg: dict,
+    contig_lengths: Dict[str, int],
+    genome_path: Path,
+    blastn_threads: int,
+) -> List[dict]:
+    """Iteratively bridge same-contig GEVEs within cluster_merge_gap and
+    re-run TIR/TSD on each merged span.
+    """
+    if not geves:
+        return geves
+    merge_gap = cfg.get("cluster_merge_gap", 200_000)
+    max_span  = cfg.get("max_cluster_span", 2_000_000)
+    host_frac = cfg.get("host_territory_fraction", 0.7)
+    n_initial = len(geves)
+
+    iteration = 0
+    total_refused = 0
+    while True:
+        iteration += 1
+        by_contig: Dict[str, List[dict]] = {}
+        for g in geves:
+            by_contig.setdefault(g["contig"], []).append(g)
+
+        next_geves: List[dict] = []
+        any_merge = False
+        n_refused_pass = 0
+
+        for contig, lst in by_contig.items():
+            lst.sort(key=lambda x: x["geve_start"])
+            contig_orfs = orfs_by_contig.get(contig, [])
+            rolling     = rolling_by_orf_per_contig.get(contig, {})
+
+            group: List[dict] = [lst[0]]
+            group_end = lst[0]["geve_end"]
+
+            def _flush(group_local):
+                """Emit the current group: re-detect TIR if 2+ pieces, else pass through."""
+                nonlocal any_merge
+                if len(group_local) > 1:
+                    merged, lmsgs = _redetect_on_merged_span(
+                        group_local, fa, contig_orfs, contig_lengths[contig],
+                        cfg, genome_path, blastn_threads,
+                    )
+                    for level, msg in lmsgs:
+                        (_LOG.warning if level == "warning" else _LOG.info)(msg)
+                    tir_str = (
+                        f"TIR={merged['tir'].tir_length} bp @ "
+                        f"{merged['tir'].tir_identity:.1f}%"
+                        if merged.get("tir") is not None else "TIR=none"
+                    )
+                    _LOG.info(
+                        f"Adjacent-GEVE merge iter {iteration}: {len(group_local)} pieces on "
+                        f"{contig} bridged into {contig}:{merged['geve_start']:,}-"
+                        f"{merged['geve_end']:,} ({merged['geve_length']:,} bp, "
+                        f"boundary={merged.get('boundary_method', 'NA')}, {tir_str})"
+                    )
+                    next_geves.append(merged)
+                    any_merge = True
+                else:
+                    next_geves.append(group_local[0])
+
+            for nxt in lst[1:]:
+                gap = nxt["geve_start"] - group_end - 1
+                proposed_end  = max(group_end, nxt["geve_end"])
+                proposed_span = proposed_end - group[0]["geve_start"] + 1
+                is_overlap = gap < 0
+                eligible = is_overlap or (
+                    (gap <= merge_gap) and (proposed_span <= max_span)
+                )
+                if eligible and (is_overlap or gap <= 0 or not _gap_is_host_territory(
+                        group_end, nxt["geve_start"], contig_orfs, rolling, host_frac)):
+                    group.append(nxt)
+                    group_end = proposed_end
+                    continue
+                if eligible:
+                    n_refused_pass += 1
+                _flush(group)
+                group = [nxt]
+                group_end = nxt["geve_end"]
+
+            _flush(group)
+
+        total_refused += n_refused_pass
+        _LOG.info(
+            f"Adjacent-GEVE merge iter {iteration}: "
+            f"{len(geves)} -> {len(next_geves)} GEVE(s) "
+            f"({n_refused_pass} refused as host territory)"
+        )
+
+        if not any_merge:
+            break
+        geves = next_geves
+
+    if iteration > 1 or len(next_geves) != n_initial:
+        _LOG.info(
+            f"Adjacent-GEVE merge: converged after {iteration} iteration(s); "
+            f"{n_initial} -> {len(next_geves)} GEVE(s) "
+            f"({total_refused} total refused as host territory)"
+        )
+    return next_geves
+
+
+def _resolve_overlapping_geves(
+    geves: List[dict],
+    fa,
+    orfs_by_contig: Dict[str, List[Orf]],
+) -> List[dict]:
+    """Merge GEVEs whose spans overlap on the same contig.
+    """
+    if not geves:
+        return geves
+    by_contig: Dict[str, List[dict]] = {}
+    for g in geves:
+        by_contig.setdefault(g["contig"], []).append(g)
+
+    resolved: List[dict] = []
+    merge_events: List[Tuple[str, int, int, int]] = []
+    for contig, lst in by_contig.items():
+        lst.sort(key=lambda x: x["geve_start"])
+        cur = dict(lst[0])
+        merged_count = 1
+        for nxt in lst[1:]:
+            if nxt["geve_start"] <= cur["geve_end"]:
+                new_start = min(cur["geve_start"], nxt["geve_start"])
+                new_end   = max(cur["geve_end"],   nxt["geve_end"])
+                cur["geve_start"]     = new_start
+                cur["geve_end"]       = new_end
+                cur["geve_length"]    = new_end - new_start + 1
+                cur["tir"]            = None
+                cur["tsd"]            = None
+                cur["has_tir"]        = False
+                cur["flank_used"]     = 0
+                cur["boundary_method"] = "viral_score_boundary"
+                contig_orfs = orfs_by_contig.get(contig, [])
+                cur["orfs"] = sorted(
+                    [o for o in contig_orfs
+                     if o.start >= new_start and o.end <= new_end],
+                    key=lambda x: x.start,
+                )
+                hms = [o.hallmark for o in cur["orfs"] if o.hallmark]
+                cur["n_hallmarks"]       = len(hms)
+                cur["hallmarks_present"] = sorted(set(hms))
+                cur["gc_geve"] = gc_of_seq(fa.fetch(contig, (new_start, new_end)))
+                merged_count += 1
+                continue
+            if merged_count > 1:
+                merge_events.append((contig, cur["geve_start"], cur["geve_end"], merged_count))
+            resolved.append(cur)
+            cur = dict(nxt)
+            merged_count = 1
+        if merged_count > 1:
+            merge_events.append((contig, cur["geve_start"], cur["geve_end"], merged_count))
+        resolved.append(cur)
+
+    if merge_events:
+        for contig, gs, ge, n in merge_events:
+            _LOG.info(
+                f"Overlap resolution: {n} overlapping GEVE(s) on {contig} merged into "
+                f"{contig}:{gs:,}-{ge:,} ({ge - gs + 1:,} bp, boundary=viral_score_boundary)"
+            )
+        _LOG.info(
+            f"Overlap resolution: {len(geves)} -> {len(resolved)} non-overlapping GEVE(s)"
+        )
+    return resolved
 
 # Output writers
 def _get_tool_versions() -> Dict[str, str]:
@@ -1297,11 +1584,6 @@ def _tir_fields(tir: Optional[TirPair]) -> dict:
 
 def load_gvog_annotations(db: Path) -> Dict[str, str]:
     """Load GVOG name lookup from gvog.complete.annot.tsv if present.
-
-    Returns a dict mapping GVOG ID -> first-token NCVOG description.
-    Missing file or unexpected format is non-fatal: logs a warning and
-    returns an empty dict so the pipeline still completes (gvog_name
-    becomes NA in the functional annotation output).
     """
     path = db / "gvog.complete.annot.tsv"
     if not path.exists():
@@ -1345,10 +1627,6 @@ def write_protein_func_tsv(
     gvog_name_map: Dict[str, str],
 ) -> None:
     """Write per-protein functional annotation table for retained GEVEs.
-
-    Emits one row per ORF in every retained GEVE (in .pep order). Best-hit
-    annotation is reported for GVOG and Pfam scans.
-    Missing values are written as 'NA'.
     """
     def _fmt_score(v: float) -> str:
         return f"{v:.1f}" if v and v > 0 else "NA"
@@ -1458,7 +1736,6 @@ def write_multifasta(
     fa_index: pyfastx.Fasta,
     path: Path,
 ) -> None:
-    # Write GEVE sequences to a multi-FASTA file.
     with open(path, "w") as fh:
         for g in geves:
             seq = fa_index.fetch(g["contig"], (g["geve_start"], g["geve_end"]))
@@ -1610,16 +1887,8 @@ def write_gff3(geves: List[dict], path: Path) -> None:
 
 def log_run_summary(
     geves: List[dict],
-    prefix: str,
     genome_path: Path,
-    elapsed: float,
 ) -> None:
-    # Emit the run-summary statistics through the logger (no separate summary file).
-    def fmt_t(s: float) -> str:
-        if s >= 3600: return f"{s / 3600:.2f} h"
-        if s >= 60:   return f"{s / 60:.2f} min"
-        return f"{s:.1f} s"
-
     n = len(geves)
     n_tir = sum(1 for g in geves if g["has_tir"])
     _LOG.info("Result Summary")
@@ -1679,13 +1948,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("-t", "--threads", type=int, default=4)
     p.add_argument("-e", "--evalue", type=float, default=DEFAULTS["evalue"])
     p.add_argument("--blastn-jobs", type=int, default=None)
-    p.add_argument("--min-hallmark-type", type=int, default=DEFAULTS["min_hallmarks"])
+    p.add_argument("-m", "--min-hallmark-type", type=int, default=DEFAULTS["min_hallmarks"])
     p.add_argument("--blastn-threads",       type=int,   default=1)
     p.add_argument("--min-contig",           type=int,   default=DEFAULTS["min_contig"])
+    p.add_argument("--cluster-merge-gap",    type=int,   default=DEFAULTS["cluster_merge_gap"])
 
     return p.parse_args(argv)
 
-def _write_empty_outputs(outdir: Path, prefix: str, genome_path: Path, t0: float) -> None:
+def _write_empty_outputs(outdir: Path, prefix: str, genome_path: Path) -> None:
     (outdir / f"{prefix}.geve.fna").write_text("")
     (outdir / f"{prefix}.geve.pep").write_text("")
     (outdir / f"{prefix}.geve.cds").write_text("")
@@ -1695,15 +1965,15 @@ def _write_empty_outputs(outdir: Path, prefix: str, genome_path: Path, t0: float
     (outdir / f"{prefix}.geve.gff3").write_text("##gff-version 3\n")
     pd.DataFrame().to_csv(outdir / f"{prefix}.summary.tsv", sep="\t", index=False)
     pd.DataFrame().to_csv(outdir / f"{prefix}.geve.func.tsv", sep="\t", index=False)
-    log_run_summary([], prefix, genome_path, time.time() - t0)
+    log_run_summary([], genome_path)
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
 
     cfg = dict(DEFAULTS)
     cfg["min_contig"]           = args.min_contig
-    cfg["min_geve_length"]      = args.min_contig
     cfg["min_hallmarks"]        = args.min_hallmark_type
+    cfg["cluster_merge_gap"]    = args.cluster_merge_gap
     cfg["evalue"]               = args.evalue
 
     args.outdir.mkdir(parents=True, exist_ok=True)
@@ -1726,13 +1996,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     _LOG.info(
         f"Parameters | min_contig={cfg['min_contig']:,} bp | "
         f"min_geve_length={cfg['min_geve_length']:,} bp | "
-        f"min_hallmarks={cfg['min_hallmarks']} | "
+        f"min_hallmarks_seed={cfg['min_hallmarks_seed']} | "
+        f"min_hallmarks_final={cfg['min_hallmarks']} | "
         f"seed_window={cfg['seed_window']:,} bp | "
         f"cluster_merge_gap={cfg['cluster_merge_gap']:,} bp | "
         f"max_cluster_span={cfg['max_cluster_span']:,} bp | "
         f"tir_flank={cfg['tir_flank_start']:,}->{cfg['tir_flank_max']:,} "
         f"step {cfg['tir_flank_step']:,} bp | "
-        f"tir_bracket_fraction={cfg['tir_bracket_fraction']}"
+        f"tir_bracket_fraction={cfg['tir_bracket_fraction']} | "
+        f"tir_min_len={cfg['tir_min_len']} bp | "
+        f"host_territory_fraction={cfg['host_territory_fraction']}"
     )
     if cfg["extend_tirless"]:
         _LOG.info(
@@ -1793,7 +2066,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     hallmark_contigs = set(contig2hallmark_hits.keys())
     if not hallmark_contigs:
         _LOG.warning("No NCLDV hallmark hits detected. No GEVE candidates.")
-        _write_empty_outputs(args.outdir, args.prefix, args.genome, t0)
+        _write_empty_outputs(args.outdir, args.prefix, args.genome)
         return 0
 
     _LOG.info(f"Hallmark-positive contigs: {len(hallmark_contigs):,}")
@@ -1804,7 +2077,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     if run_pfam:
         scan_pfam(gvog_targets, pfam_hmm, cfg["evalue"], args.threads)
 
-    # Asymmetric Pfam penalty: virbit - max(0, pfambit - virbit)
     for o in orfs_by_id.values():
         o.net_score = o.virbit - max(0.0, o.pfambit - o.virbit)
 
@@ -1813,19 +2085,25 @@ def main(argv: Optional[List[str]] = None) -> int:
         orfs_by_contig, cfg["rolling_window"], hallmark_contigs,
     )
 
-    # Stage 3: seeding (with same-contig cluster merging + host-territory gap check)
+    # Stage 3: seeding uses min_hallmarks_seed (always 1) — every hallmark anchors a seed
     clusters = find_seed_clusters(
         orfs_by_contig,
         cfg["seed_window"],
-        cfg["min_hallmarks"],
+        cfg["min_hallmarks_seed"],
         cfg["cluster_merge_gap"],
         cfg["max_cluster_span"],
         rolling_by_orf_per_contig=rolling_by_orf_per_contig,
+        host_fraction=cfg["host_territory_fraction"],
     )
     if not clusters:
         _LOG.warning("No clusters passed hallmark-density criterion. No GEVE candidates.")
-        _write_empty_outputs(args.outdir, args.prefix, args.genome, t0)
+        _write_empty_outputs(args.outdir, args.prefix, args.genome)
         return 0
+
+    # Stage 3b: viral-score pre-scan + post-extension same-contig merge
+    clusters = prescan_and_merge_clusters(
+        clusters, orfs_by_contig, rolling_by_orf_per_contig, cfg,
+    )
 
     tasks = []
     for ci, cl in enumerate(clusters, start=1):
@@ -1835,11 +2113,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             contig=contig,
             cluster_start=cl["cluster_start"],
             cluster_end=cl["cluster_end"],
+            pre_start=cl["pre_start"],
+            pre_end=cl["pre_end"],
+            prescan_diag=cl.get("prescan_diag"),
             contig_length=contig_lengths[contig],
             cfg=cfg,
             genome_path=str(args.genome),
             contig_orfs=orfs_by_contig.get(contig, []),
-            rolling_by_orf=rolling_by_orf_per_contig.get(contig, {}),
             blastn_threads=blastn_threads,
         ))
 
@@ -1912,24 +2192,32 @@ def main(argv: Optional[List[str]] = None) -> int:
     if fatal_msg is not None:
         return 2
 
+    # Stage 7.5a: iteratively bridge same-contig GEVEs and re-run TIR/TSD
+    raw_geves = _merge_adjacent_geves(
+        raw_geves, fa, orfs_by_contig, rolling_by_orf_per_contig, cfg,
+        contig_lengths, args.genome, blastn_threads,
+    )
+
+    # Stage 7.5b: resolve overlapping GEVE spans (drop spurious TIRs, merge regions)
+    raw_geves = _resolve_overlapping_geves(raw_geves, fa, orfs_by_contig)
+
+    # Stage 7.6: final QC — require >= min_hallmarks distinct types on the merged GEVE
+    before = len(raw_geves)
+    raw_geves = [
+        g for g in raw_geves
+        if len(g["hallmarks_present"]) >= cfg["min_hallmarks"]
+    ]
+    n_dropped = before - len(raw_geves)
+    if n_dropped:
+        _LOG.info(
+            f"Final hallmark filter: dropped {n_dropped} GEVE(s) with "
+            f"< {cfg['min_hallmarks']} distinct hallmark types"
+        )
+
     # Sort and assign final IDs by natural contig order, then position
     raw_geves.sort(key=lambda g: (_natural_key(g["contig"]), g["geve_start"]))
     for i, g in enumerate(raw_geves, start=1):
         g["geve_id"] = f"{args.prefix}_GEVE_{i:03d}"
-
-    # Warn on overlapping spans within a contig
-    by_contig_gevs: Dict[str, List[dict]] = {}
-    for g in raw_geves:
-        by_contig_gevs.setdefault(g["contig"], []).append(g)
-    for contig, lst in by_contig_gevs.items():
-        lst.sort(key=lambda x: x["geve_start"])
-        for a, b in zip(lst, lst[1:]):
-            if b["geve_start"] <= a["geve_end"]:
-                _LOG.warning(
-                    f"Overlapping GEVE spans on {contig}: "
-                    f"{a['geve_id']} ({a['geve_start']:,}-{a['geve_end']:,}) "
-                    f"overlaps {b['geve_id']} ({b['geve_start']:,}-{b['geve_end']:,})"
-                )
 
     n_tir          = sum(1 for g in raw_geves if g["has_tir"])
     n_score_bound  = sum(1 for g in raw_geves if g.get("boundary_method") == "viral_score_boundary")
@@ -1981,7 +2269,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         timing = f"{elapsed:.1f} s"
     _LOG.info(f"findGEVE completed in {timing}")
-    log_run_summary(raw_geves, args.prefix, args.genome, elapsed)
+    log_run_summary(raw_geves, args.genome)
     return 0
 
 if __name__ == "__main__":
