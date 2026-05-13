@@ -1589,7 +1589,7 @@ def load_gvog_annotations(db: Path) -> Dict[str, str]:
     if not path.exists():
         _LOG.warning(
             f"GVOG annotation file not found: {path}; "
-            f"gvog_name will be NA in {{prefix}}.geve.func.tsv"
+            f"gvog_name will be NA in {{prefix}}.func.tsv"
         )
         return {}
     try:
@@ -1964,7 +1964,7 @@ def _write_empty_outputs(outdir: Path, prefix: str, genome_path: Path) -> None:
     )
     (outdir / f"{prefix}.geve.gff3").write_text("##gff-version 3\n")
     pd.DataFrame().to_csv(outdir / f"{prefix}.summary.tsv", sep="\t", index=False)
-    pd.DataFrame().to_csv(outdir / f"{prefix}.geve.func.tsv", sep="\t", index=False)
+    pd.DataFrame().to_csv(outdir / f"{prefix}.func.tsv", sep="\t", index=False)
     log_run_summary([], genome_path)
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -2085,7 +2085,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         orfs_by_contig, cfg["rolling_window"], hallmark_contigs,
     )
 
-    # Stage 3: seeding uses min_hallmarks_seed (always 1) — every hallmark anchors a seed
+    # Stage 3: seeding uses min_hallmarks_seed
     clusters = find_seed_clusters(
         orfs_by_contig,
         cfg["seed_window"],
@@ -2237,7 +2237,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     marker_path   = out / f"{args.prefix}.markerout"
     summary_path  = out / f"{args.prefix}.summary.tsv"
     gff3_path     = out / f"{args.prefix}.geve.gff3"
-    func_path     = out / f"{args.prefix}.geve.func.tsv"
+    func_path     = out / f"{args.prefix}.func.tsv"
 
     gvog_name_map = load_gvog_annotations(db)
 
