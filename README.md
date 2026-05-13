@@ -180,7 +180,7 @@ Finds genomic regions containing multiple distinct viral hallmark types within a
 ![Seed candidate GEVE 1](docs/3.seed_candidate_1.png)
 **Merging process**
 
-Many anchors produce overlapping windows. Any two clusters on the same contig whose spans overlap are merge together. After this pass, every cluster on a contig is non-overlapping. If there any two adjacent clusters it will be merge if their inter-cluster gap is `≤ 50 kb` and the merged span would not exceed `2 mb`.
+Many anchors produce overlapping windows. Any two clusters on the same contig whose spans overlap are merge together. After this pass, every cluster on a contig is non-overlapping. If there any two adjacent clusters it will be merge if their inter-cluster gap is `≤ 100 kb` and the merged span would not exceed `2 mb`.
 
 Example case for two cluster in the same contig are merged: 
 ![Seed candidate GEVE 2](docs/3.seed_candidate_2.png)
