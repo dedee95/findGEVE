@@ -139,7 +139,7 @@ The input genome can be plain FASTA or gzip-compressed FASTA.
 Retained GEVE are sorted by contig and position, assigned IDs, and store to output directory.
 
 ```
-├── Chlamydomonas.geve.fna        # Retained GEVE sequence
+├── Chlamydomonas.geve.fna        # Retained GEVE sequence (TIR included)
 ├── Chlamydomonas.summary.tsv     # Per-GEVE summary table
 ├── Chlamydomonas.markerout       # Hallmark genes, TIR, and TSD coordinate
 ├── Chlamydomonas.geve.gff        # Annotated GEVE relative to host genome
