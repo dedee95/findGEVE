@@ -45,12 +45,9 @@ Optionals:
   --blastn-jobs        Parallel TIR-detection workers                [default: --threads]
   -m, --min-hallmark-type
                        Minimum number of distinct hallmark types
-                       required in the final retained GEVE
-                       (seeding always uses >= 1)                    [default: 2]
-  --min-contig         Minimum contig length to scan for GEVE 
-                       detection                                     [default: 50_000]
-  --cluster-merge-gap  Maximum gap (bp) between same-contig clusters
-                       eligible for merging                          [default: 100_000]
+                       required in the final retained GEVE           [default: 2]
+  -l, --min-geve-len   Minimum GEVE length                           [default: 50_000]
+  --cluster-merge-gap  Maximum gap (bp) between same-contig clusters [default: 100_000]
   -h, --help           Show this help and exit
 """
 
@@ -1950,7 +1947,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--blastn-jobs", type=int, default=None)
     p.add_argument("-m", "--min-hallmark-type", type=int, default=DEFAULTS["min_hallmarks"])
     p.add_argument("--blastn-threads",       type=int,   default=1)
-    p.add_argument("--min-contig",           type=int,   default=DEFAULTS["min_contig"])
+    p.add_argument("-l", "--min-geve-len",   type=int,   default=DEFAULTS["min_geve_length"])
     p.add_argument("--cluster-merge-gap",    type=int,   default=DEFAULTS["cluster_merge_gap"])
 
     return p.parse_args(argv)
@@ -1971,7 +1968,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
 
     cfg = dict(DEFAULTS)
-    cfg["min_contig"]           = args.min_contig
+    cfg["min_geve_length"]      = args.min_geve_len
     cfg["min_hallmarks"]        = args.min_hallmark_type
     cfg["cluster_merge_gap"]    = args.cluster_merge_gap
     cfg["evalue"]               = args.evalue
