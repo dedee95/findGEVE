@@ -117,12 +117,9 @@ Optionals:
   --blastn-jobs        Parallel TIR-detection workers                [default: --threads]
   -m, --min-hallmark-type
                        Minimum number of distinct hallmark types
-                       required in the final retained GEVE
-                       (seeding always uses >= 1)                    [default: 2]
-  --min-contig         Minimum contig length to scan for GEVE 
-                       detection                                     [default: 50_000]
-  --cluster-merge-gap  Maximum gap (bp) between same-contig clusters
-                       eligible for merging                          [default: 100_000]
+                       required in the final retained GEVE           [default: 2]
+  -l, --min-geve-len   Minimum GEVE length                           [default: 50_000]
+  --cluster-merge-gap  Maximum gap (bp) between same-contig clusters [default: 100_000]
   -h, --help           Show this help and exit
 ```
 
