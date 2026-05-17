@@ -2125,6 +2125,42 @@ def _write_empty_outputs(outdir: Path, prefix: str, genome_path: Path) -> None:
     pd.DataFrame().to_csv(outdir / f"{prefix}.func.tsv", sep="\t", index=False)
     log_run_summary([], genome_path)
 
+def run_geve_plot(marker_path: Path, bed_path: Path, outdir: Path, prefix: str) -> Optional[Path]:
+    """Run sibling findGEVE_plot.py to produce a multi-page PDF visualisation.
+    Non-fatal: returns the PDF path on success, or None on any failure."""
+    script = Path(__file__).resolve().parent / "findGEVE_plot.py"
+    if not script.is_file():
+        _LOG.warning(f"findGEVE_plot.py not found at {script}; skipping plot step")
+        return None
+    cmd = [sys.executable, str(script),
+           str(marker_path.resolve()), str(bed_path.resolve())]
+    _LOG.info(f"Plotting GEVEs: {' '.join(cmd)}")
+    try:
+        proc = subprocess.run(
+            cmd, cwd=str(outdir),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, check=False,
+        )
+    except OSError as exc:
+        _LOG.warning(f"Failed to launch findGEVE_plot.py: {exc}")
+        return None
+    for line in proc.stdout.splitlines():
+        if line.strip():
+            _LOG.info(f"[plot] {line}")
+    for line in proc.stderr.splitlines():
+        if line.strip():
+            _LOG.warning(f"[plot] {line}")
+    if proc.returncode != 0:
+        _LOG.warning(f"findGEVE_plot.py exited with code {proc.returncode}; no plot produced")
+        return None
+    # findGEVE_plot.py names its output <word-before-first-underscore-of-GEVE-name>.plot.pdf
+    plot_prefix = prefix.split("_", 1)[0]
+    pdf_path = outdir / f"{plot_prefix}.plot.pdf"
+    if not pdf_path.is_file():
+        _LOG.warning(f"Plot script finished but {pdf_path} was not produced")
+        return None
+    return pdf_path
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
 
@@ -2414,6 +2450,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     hallmark_pep_paths = write_hallmark_peps(raw_geves, out, args.prefix)
 
+    # Stage 9: render the per-GEVE visualisation 
+    plot_pdf = run_geve_plot(marker_path, bed_path, args.outdir, args.prefix) if raw_geves else None
+
     _LOG.output(f"GEVE sequences  -> {fasta_path}")
     _LOG.output(f"GEVE proteins   -> {pep_path}")
     _LOG.output(f"GEVE CDS        -> {cds_path}")
@@ -2424,6 +2463,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     _LOG.output(f"Viz windows BED -> {bed_path}")
     for hp in hallmark_pep_paths:
         _LOG.output(f"Hallmark pep    -> {hp}")
+    if plot_pdf is not None:
+        _LOG.output(f"GEVE plot       -> {plot_pdf}")
     _LOG.output(f"Run log         -> {log_path}")
 
     elapsed = time.time() - t0
