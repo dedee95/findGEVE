@@ -18,6 +18,7 @@ from collections import Counter, defaultdict
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
+from itertools import product
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -928,6 +929,14 @@ def gc_of_seq(seq: str) -> float:
     valid = gc + at
     return float(100.0 * gc / valid) if valid > 0 else float("nan")
 
+def viz_flank_size(geve_length: int) -> int:
+    """Adaptive flank by GEVE length tier (100k / 200k / 300k)."""
+    if geve_length < 300_000:
+        return 100_000
+    if geve_length < 1_000_000:
+        return 200_000
+    return 300_000
+
 # Stage 8: per-cluster worker (TIR + TSD + GC)
 def extend_tirless_boundaries(
     contig_orfs: List[Orf],
@@ -1717,27 +1726,42 @@ def write_summary_tsv(geves: List[dict], path: Path) -> None:
         ).reset_index(drop=True)
     df.to_csv(path, sep="\t", index=False)
 
-def write_markerout(geves: List[dict], path: Path) -> None:
+def write_markerout(
+    geves: List[dict],
+    path: Path,
+    orfs_by_contig: Dict[str, List[Orf]],
+    contig_lengths: Dict[str, int],
+) -> None:
+    """Rich per-feature table for visualization (GEVE, flanks, TIR/TSD, all ORFs in flanked window)."""
     with open(path, "w") as fh:
-        fh.write("contig\tgeve_name\tfeature\tstart\tend\tstrand\te_value\tscore\n")
+        fh.write("contig\tgeve_name\tfeature\tname\tstart\tend\tstrand\te_value\tscore\n")
         for g in geves:
             geve_name = g["geve_id"]
             contig = g["contig"]
-            for o in g["orfs"]:
-                if o.hallmark:
-                    strand = "+" if o.strand >= 0 else "-"
-                    fh.write(
-                        f"{contig}\t{geve_name}\t{o.hallmark}\t{o.start}\t{o.end}\t"
-                        f"{strand}\t{o.hallmark_evalue:.2e}\t{o.hallmark_bitscore:.1f}\n"
-                    )
+            geve_start, geve_end = g["geve_start"], g["geve_end"]
+            clen = contig_lengths.get(contig, geve_end)
+            flank = viz_flank_size(g["geve_length"])
+            region_start = max(1, geve_start - flank)
+            region_end = min(clen, geve_end + flank)
+            fh.write(
+                f"{contig}\t{geve_name}\tGEVE\t.\t{geve_start}\t{geve_end}\t.\tNA\t{g['geve_length']}\n"
+            )
+            if region_start < geve_start:
+                fh.write(
+                    f"{contig}\t{geve_name}\tflank_left\t.\t{region_start}\t{geve_start - 1}\t.\tNA\tNA\n"
+                )
+            if region_end > geve_end:
+                fh.write(
+                    f"{contig}\t{geve_name}\tflank_right\t.\t{geve_end + 1}\t{region_end}\t.\tNA\tNA\n"
+                )
             tir = g["tir"]
             if tir is not None:
                 fh.write(
-                    f"{contig}\t{geve_name}\tTIR_left\t{tir.left_start}\t{tir.left_end}\t"
+                    f"{contig}\t{geve_name}\tTIR_left\t.\t{tir.left_start}\t{tir.left_end}\t"
                     f"+\tNA\t{tir.score}\n"
                 )
                 fh.write(
-                    f"{contig}\t{geve_name}\tTIR_right\t{tir.right_start}\t{tir.right_end}\t"
+                    f"{contig}\t{geve_name}\tTIR_right\t.\t{tir.right_start}\t{tir.right_end}\t"
                     f"-\tNA\t{tir.score}\n"
                 )
             tsd = g["tsd"]
@@ -1747,13 +1771,119 @@ def write_markerout(geves: List[dict], path: Path) -> None:
                 rtsd_start = tir.right_end + 1 + tsd.right_shift
                 rtsd_end   = rtsd_start + tsd.length - 1
                 fh.write(
-                    f"{contig}\t{geve_name}\tTSD_5p\t{ltsd_start}\t{ltsd_end}\t"
+                    f"{contig}\t{geve_name}\tTSD_5p\t{tsd.sequence_left}\t{ltsd_start}\t{ltsd_end}\t"
                     f"+\tNA\t{tsd.identity:.1f}\n"
                 )
                 fh.write(
-                    f"{contig}\t{geve_name}\tTSD_3p\t{rtsd_start}\t{rtsd_end}\t"
+                    f"{contig}\t{geve_name}\tTSD_3p\t{tsd.sequence_right}\t{rtsd_start}\t{rtsd_end}\t"
                     f"+\tNA\t{tsd.identity:.1f}\n"
                 )
+            for o in orfs_by_contig.get(contig, []):
+                if o.end < region_start or o.start > region_end:
+                    continue
+                strand = "+" if o.strand >= 0 else "-"
+                if o.hallmark:
+                    fh.write(
+                        f"{contig}\t{geve_name}\thallmark\t{o.hallmark}\t{o.start}\t{o.end}\t"
+                        f"{strand}\t{o.hallmark_evalue:.2e}\t{o.hallmark_bitscore:.1f}\n"
+                    )
+                elif o.gvog:
+                    fh.write(
+                        f"{contig}\t{geve_name}\tgvog\t{o.gvog}\t{o.start}\t{o.end}\t"
+                        f"{strand}\t{o.gvog_evalue:.2e}\t{o.gvog_bitscore:.1f}\n"
+                    )
+                elif o.best_pfam_acc:
+                    name = o.best_pfam_name or o.best_pfam_acc
+                    fh.write(
+                        f"{contig}\t{geve_name}\tpfam\t{name}\t{o.start}\t{o.end}\t"
+                        f"{strand}\t{o.best_pfam_evalue:.2e}\t{o.best_pfam_bitscore:.1f}\n"
+                    )
+                else:
+                    fh.write(
+                        f"{contig}\t{geve_name}\torf\t.\t{o.start}\t{o.end}\t{strand}\tNA\tNA\n"
+                    )
+
+def write_geve_bed(
+    geves: List[dict],
+    fa: pyfastx.Fasta,
+    orfs_by_contig: Dict[str, List[Orf]],
+    rolling_by_orf_per_contig: Dict[str, Dict[str, float]],
+    contig_lengths: Dict[str, int],
+    path: Path,
+    window: int = 1000,
+    step: int = 250,
+) -> None:
+    """Sliding-window track table for visualization (1-based inclusive coords)."""
+    needed = sorted({g["contig"] for g in geves})
+    contig_seqs: Dict[str, str] = {
+        c: fa.fetch(c, (1, contig_lengths[c])) for c in needed
+    }
+    rows: List[dict] = []
+    for g in geves:
+        contig = g["contig"]
+        clen = contig_lengths[contig]
+        geve_start, geve_end = g["geve_start"], g["geve_end"]
+        flank = viz_flank_size(g["geve_length"])
+        region_start = max(1, geve_start - flank)
+        region_end = min(clen, geve_end + flank)
+        seq = contig_seqs[contig]
+        contig_orfs = sorted(orfs_by_contig.get(contig, []), key=lambda o: o.start)
+        rolling = rolling_by_orf_per_contig.get(contig, {})
+        w_start = region_start
+        while w_start + window - 1 <= region_end:
+            w_end = w_start + window - 1
+            sub = seq[w_start - 1:w_end]
+            arr = np.frombuffer(sub.encode("ascii"), dtype=np.uint8)
+            gc = int(((arr == ord("G")) | (arr == ord("C"))).sum())
+            at = int(((arr == ord("A")) | (arr == ord("T"))).sum())
+            gc_pct = float(100.0 * gc / (gc + at)) if (gc + at) > 0 else float("nan")
+            center = (w_start + w_end) // 2
+            if center < geve_start:
+                rtype = "flank_left"
+            elif center <= geve_end:
+                rtype = "geve"
+            else:
+                rtype = "flank_right"
+            n_orfs = n_gvog = n_pfam = 0
+            score_sum = 0.0
+            score_n = 0
+            for o in contig_orfs:
+                if o.end < w_start:
+                    continue
+                if o.start > w_end:
+                    break
+                n_orfs += 1
+                if o.hallmark or o.gvog:
+                    n_gvog += 1
+                if o.best_pfam_acc:
+                    n_pfam += 1
+                rv = rolling.get(o.orf_id)
+                if rv is not None:
+                    score_sum += rv
+                    score_n += 1
+            rolling_mean = score_sum / score_n if score_n > 0 else float("nan")
+            rows.append(dict(
+                contig_id=contig,
+                window_start=w_start,
+                window_end=w_end,
+                geve_name=g["geve_id"],
+                rel_start=w_start - geve_start,
+                rel_end=w_end - geve_start,
+                region_type=rtype,
+                gc="NA" if np.isnan(gc_pct) else f"{gc_pct:.3f}",
+                rolling_score_mean="NA" if np.isnan(rolling_mean) else f"{rolling_mean:.4f}",
+                n_orfs=n_orfs,
+                gvog_hits=n_gvog,
+                pfam_hits=n_pfam,
+            ))
+            w_start += step
+    df = pd.DataFrame(rows, columns=[
+        "contig_id", "window_start", "window_end", "geve_name",
+        "rel_start", "rel_end", "region_type",
+        "gc", "rolling_score_mean",
+        "n_orfs", "gvog_hits", "pfam_hits",
+    ])
+    df.to_csv(path, sep="\t", index=False)
 
 def write_multifasta(
     geves: List[dict],
@@ -1984,7 +2114,11 @@ def _write_empty_outputs(outdir: Path, prefix: str, genome_path: Path) -> None:
     (outdir / f"{prefix}.geve.pep").write_text("")
     (outdir / f"{prefix}.geve.cds").write_text("")
     (outdir / f"{prefix}.markerout").write_text(
-        "contig\tgeve_name\tfeature\tstart\tend\tstrand\te_value\tscore\n"
+        "contig\tgeve_name\tfeature\tname\tstart\tend\tstrand\te_value\tscore\n"
+    )
+    (outdir / f"{prefix}.geve.bed").write_text(
+        "contig_id\twindow_start\twindow_end\tgeve_name\trel_start\trel_end\t"
+        "region_type\tgc\trolling_score_mean\tn_orfs\tgvog_hits\tpfam_hits\n"
     )
     (outdir / f"{prefix}.geve.gff3").write_text("##gff-version 3\n")
     pd.DataFrame().to_csv(outdir / f"{prefix}.summary.tsv", sep="\t", index=False)
@@ -2263,16 +2397,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     summary_path  = out / f"{args.prefix}.summary.tsv"
     gff3_path     = out / f"{args.prefix}.geve.gff3"
     func_path     = out / f"{args.prefix}.func.tsv"
+    bed_path      = out / f"{args.prefix}.geve.bed"
 
     gvog_name_map = load_gvog_annotations(db)
 
     write_multifasta(raw_geves, fa, fasta_path)
     write_protein_fasta(raw_geves, pep_path)
     write_cds_fasta(raw_geves, fa, cds_path)
-    write_markerout(raw_geves, marker_path)
+    write_markerout(raw_geves, marker_path, orfs_by_contig, contig_lengths)
     write_summary_tsv(raw_geves, summary_path)
     write_gff3(raw_geves, gff3_path)
     write_protein_func_tsv(raw_geves, func_path, gvog_name_map)
+    write_geve_bed(
+        raw_geves, fa, orfs_by_contig, rolling_by_orf_per_contig,
+        contig_lengths, bed_path,
+    )
     hallmark_pep_paths = write_hallmark_peps(raw_geves, out, args.prefix)
 
     _LOG.output(f"GEVE sequences  -> {fasta_path}")
@@ -2282,6 +2421,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     _LOG.output(f"Summary table   -> {summary_path}")
     _LOG.output(f"GFF3 annotation -> {gff3_path}")
     _LOG.output(f"Functional annot-> {func_path}")
+    _LOG.output(f"Viz windows BED -> {bed_path}")
     for hp in hallmark_pep_paths:
         _LOG.output(f"Hallmark pep    -> {hp}")
     _LOG.output(f"Run log         -> {log_path}")
