@@ -144,6 +144,7 @@ Retained GEVE are sorted by contig and position, assigned IDs, and store to outp
 ├── Chlamydomonas.geve.fna        # Retained GEVE sequence (TIR included)
 ├── Chlamydomonas.summary.tsv     # Per-GEVE summary table
 ├── Chlamydomonas.markerout       # Hallmark genes, TIR, and TSD coordinate
+├── Chlamidomonas.geve.bed        # bed file to generate plot
 ├── Chlamydomonas.geve.gff        # Annotated GEVE relative to host genome
 ├── Chlamydomonas.geve.cds        # Coding sequence for each retained GEVE
 ├── Chlamidomonas.func.tsv        # Functional annotation for each retained GEVE proteins
