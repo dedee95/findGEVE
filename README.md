@@ -167,9 +167,12 @@ After you have the result from `findGEVE.py`, you can generate a visualization f
 ```
 ./findGEVE_plot.py Chlamydomonas.markerout Chlamidomonas.geve.bed
 ```
+
 Here is the result example:
 
+![findGEVE plot example](docs/findGEVE_plot_example.png)
 
+Default output will be in multipage `.pdf` format. If you have more than one GEVE, you will have more than one plot. Each GEVE will have their own plot per page.
 
 ## 4. findGEVE algorithm detail
 This tool has six main steps for robust GEVE identification. It can be used on contig- or chromosome-level genome assemblies.
