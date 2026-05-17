@@ -438,6 +438,34 @@ def _gap_is_host_territory(
     n_neg = sum(1 for o in gap_orfs if rolling.get(o.orf_id, 0.0) < 0)
     return (n_neg / len(gap_orfs)) > host_fraction
 
+def _seed_one_contig(
+    args: Tuple[str, List[Orf], int, int]
+) -> Tuple[str, List[dict]]:
+    contig, hallmark_orfs, window_size, min_hallmarks = args
+    half = window_size // 2
+    out: List[dict] = []
+    if len(hallmark_orfs) < min_hallmarks:
+        return contig, out
+    hallmark_orfs = sorted(hallmark_orfs, key=lambda x: x.start)
+    starts = np.array([o.start for o in hallmark_orfs])
+    ends   = np.array([o.end   for o in hallmark_orfs])
+    for anchor in hallmark_orfs:
+        mid = (anchor.start + anchor.end) // 2
+        wstart, wend = mid - half, mid + half
+        mask = (starts <= wend) & (ends >= wstart)
+        members = [hallmark_orfs[i] for i in np.nonzero(mask)[0]]
+        fams = {m.hallmark for m in members}
+        if len(fams) < min_hallmarks:
+            continue
+        out.append(dict(
+            contig=contig,
+            cluster_start=min(m.start for m in members),
+            cluster_end=max(m.end for m in members),
+            orf_ids=[m.orf_id for m in members],
+            hallmarks=sorted(fams),
+        ))
+    return contig, out
+
 def find_seed_clusters(
     orfs_by_contig: Dict[str, List[Orf]],
     window_size: int,
@@ -446,34 +474,33 @@ def find_seed_clusters(
     max_cluster_span: int,
     rolling_by_orf_per_contig: Optional[Dict[str, Dict[str, float]]] = None,
     host_fraction: float = 0.7,
+    threads: int = 1,
 ) -> List[dict]:
-    """Identify candidate GEVE clusters by sliding window over hallmark ORFs."""
-    half = window_size // 2
+    """Identify candidate GEVE clusters by sliding window over hallmark ORFs.
+    """
     raw: List[dict] = []
     rolling_by_orf_per_contig = rolling_by_orf_per_contig or {}
-
+    work_items: List[Tuple[str, List[Orf], int, int]] = []
     for contig, orfs in orfs_by_contig.items():
         hallmark_orfs = [o for o in orfs if o.hallmark is not None]
         if len(hallmark_orfs) < min_hallmarks:
             continue
-        hallmark_orfs.sort(key=lambda x: x.start)
-        starts = np.array([o.start for o in hallmark_orfs])
-        ends   = np.array([o.end   for o in hallmark_orfs])
-        for anchor in hallmark_orfs:
-            mid = (anchor.start + anchor.end) // 2
-            wstart, wend = mid - half, mid + half
-            mask = (starts <= wend) & (ends >= wstart)
-            members = [hallmark_orfs[i] for i in np.nonzero(mask)[0]]
-            fams = {m.hallmark for m in members}
-            if len(fams) < min_hallmarks:
-                continue
-            raw.append(dict(
-                contig=contig,
-                cluster_start=min(m.start for m in members),
-                cluster_end=max(m.end for m in members),
-                orf_ids=[m.orf_id for m in members],
-                hallmarks=sorted(fams),
-            ))
+        work_items.append((contig, hallmark_orfs, window_size, min_hallmarks))
+
+    executor = None
+    if threads > 1 and len(work_items) > 1:
+        executor = ProcessPoolExecutor(max_workers=threads)
+        results_iter = executor.map(_seed_one_contig, work_items, chunksize=1)
+    else:
+        results_iter = (_seed_one_contig(wi) for wi in work_items)
+
+    try:
+        for _contig, contig_raw in results_iter:
+            if contig_raw:
+                raw.extend(contig_raw)
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True)
 
     raw.sort(key=lambda c: (c["contig"], c["cluster_start"]))
     overlap_merged: List[dict] = []
@@ -2091,6 +2118,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         cfg["max_cluster_span"],
         rolling_by_orf_per_contig=rolling_by_orf_per_contig,
         host_fraction=cfg["host_territory_fraction"],
+        threads=args.threads,
     )
     if not clusters:
         _LOG.warning("No clusters passed hallmark-density criterion. No GEVE candidates.")
