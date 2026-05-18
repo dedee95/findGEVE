@@ -103,6 +103,8 @@ After all dependencies are installed, type the help command (`./findGEVE.py –h
 ```
 findGEVE.py - Identify Giant Endogenous Viral Elements (GEVEs) in eukaryotic genome assemblies.
 
+findGEVE.py - Identify Giant Endogenous Viral Elements (GEVEs) in eukaryotic genome assemblies.
+
 Usage: findGEVE.py -db <directory> --prefix <prefix> <genome.fa> [OPTIONS]
 
 Mandatory:
@@ -114,9 +116,8 @@ Mandatory:
 Optionals:
   -o, --outdir         Output directory                              [default: ./Result_<YYYYMMDD>]
   -t, --threads        CPU threads for ORF prediction and HMM search [default: 4]
+  -p, --parallel       Parallel seed-clustering and TIR workers      [default: --threads]
   -e, --evalue         E-value cutoff for HMM searches               [default: 1e-5]
-  -p, --parallel       Parallel workers for seed clustering and
-                       TIR-detection (blastn) stages                 [default: --threads]
   -m, --min-hallmark-type
                        Minimum number of distinct hallmark types
                        required in the final retained GEVE           [default: 2]
