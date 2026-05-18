@@ -687,8 +687,10 @@ def plot_one_geve(marker: pd.DataFrame, bed: pd.DataFrame, geve_name: str,
 
     height_by_key = {
         "viral_score": 1.12, "gc": 0.50,
-        "intron": 0.50, "exon": 0.50, "repeat": 0.30,
-        "gvog": 0.35, "pfam": 0.35, "hallmark": 0.26,
+        # Keep gene-structure coverage tracks visibly smaller than GC.
+        "intron": 0.32, "exon": 0.32,
+        # Keep all 1-D strip heatmaps the same height as the hallmark ORF layer.
+        "repeat": 0.26, "gvog": 0.26, "pfam": 0.26, "hallmark": 0.26,
     }
     fig_height = FIG_HEIGHT + 0.32 * max(0, len(track_specs) - 5)
     fig = plt.figure(figsize=(FIG_WIDTH, fig_height), constrained_layout=False)
