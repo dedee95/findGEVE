@@ -132,9 +132,6 @@ Example using test data obtained from [Science](https://www.science.org/doi/10.1
 	test/Chlamydomonas_reinhardtii.contig536.fa \
 	-db database \
 	--prefix Chlamydomonas \
-	--threads 16 \
-	--min-hallmark-type 3 \
-	--blastn-jobs 8
 ```
 
 The input genome can be plain FASTA or gzip-compressed FASTA.
