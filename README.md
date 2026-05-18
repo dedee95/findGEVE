@@ -103,8 +103,6 @@ After all dependencies are installed, type the help command (`./findGEVE.py –h
 ```
 findGEVE.py - Identify Giant Endogenous Viral Elements (GEVEs) in eukaryotic genome assemblies.
 
-findGEVE.py - Identify Giant Endogenous Viral Elements (GEVEs) in eukaryotic genome assemblies.
-
 Usage: findGEVE.py -db <directory> --prefix <prefix> <genome.fa> [OPTIONS]
 
 Mandatory:
