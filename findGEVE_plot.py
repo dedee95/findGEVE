@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import math
 import re
 import sys
@@ -14,7 +15,12 @@ from matplotlib.backends.backend_pdf import PdfPages
 import numpy as np
 import pandas as pd
 
-USAGE = "Usage: python findGEVE_plot.py <prefix.markerout> <prefix.geve.bed>"
+USAGE = """Usage: python findGEVE_plot.py [options] <prefix.markerout> <prefix.geve.bed>
+
+Options:
+  -g, --gff FILE       Gene annotation GFF3 (BRAKER/AUGUSTUS/eukaryotic gene annotation)
+  -r, --repeat FILE    Repeat/TE annotation GFF3
+"""
 
 PLOT_COLORS = {
     "viral_score": "#ec3028",
@@ -22,6 +28,9 @@ PLOT_COLORS = {
     "gc_midline": "#d9d9d9",
     "gvog": "#1497a5",
     "pfam": "#756bb1",
+    "intron": "#dd53ea", 
+    "exon": "#3ba9ef",   
+    "repeat": "#ffa46c",   
     "geve_highlight": "#e6e6e6",
     "track_background": "#ffffff",
     "line_track_background": "#fbfbfb",
@@ -42,10 +51,8 @@ FIG_HEIGHT = 8.5
 
 _NATKEY_SPLIT = re.compile(r"(\d+)")
 
-
 def _natural_key(s: str):
     return [int(t) if t.isdigit() else t.lower() for t in _NATKEY_SPLIT.split(str(s))]
-
 
 def _read_markerout(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path, sep="\t", dtype={
@@ -73,6 +80,258 @@ def _read_bed(path: Path) -> pd.DataFrame:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
 
+def _read_gff(path: Optional[Path]) -> pd.DataFrame:
+    """Read a GFF/GFF3 file into a minimal interval dataframe.
+    """
+    if path is None:
+        return pd.DataFrame(columns=["seqid", "source", "feature", "start", "end",
+                                     "score", "strand", "phase", "attributes"])
+    rows = []
+    with path.open() as fh:
+        for line in fh:
+            if not line.strip() or line.startswith("#"):
+                continue
+            parts = line.rstrip("\n").split("\t", 8)
+            if len(parts) < 9:
+                continue
+            rows.append(parts[:9])
+    if not rows:
+        return pd.DataFrame(columns=["seqid", "source", "feature", "start", "end",
+                                     "score", "strand", "phase", "attributes"])
+    df = pd.DataFrame(rows, columns=["seqid", "source", "feature", "start", "end",
+                                     "score", "strand", "phase", "attributes"])
+    df["seqid"] = df["seqid"].astype(str)
+    df["feature"] = df["feature"].astype(str)
+    df["start"] = pd.to_numeric(df["start"], errors="coerce").astype("Int64")
+    df["end"] = pd.to_numeric(df["end"], errors="coerce").astype("Int64")
+    df = df.dropna(subset=["start", "end"]).copy()
+    df["start"] = df["start"].astype(int)
+    df["end"] = df["end"].astype(int)
+    # Be tolerant of malformed records with reversed coordinates.
+    swap = df["start"] > df["end"]
+    if swap.any():
+        df.loc[swap, ["start", "end"]] = df.loc[swap, ["end", "start"]].to_numpy()
+    return df
+
+def _parse_gff_attributes(attributes: str) -> Dict[str, str]:
+    """Parse GFF3 attributes into a dictionary.
+    """
+    out: Dict[str, str] = {}
+    for item in str(attributes or "").strip().strip(";").split(";"):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" in item:
+            key, value = item.split("=", 1)
+        elif " " in item:
+            key, value = item.split(None, 1)
+        else:
+            key, value = item, ""
+        out[key.strip()] = value.strip()
+    return out
+
+
+def _gff_attr(attributes: str, key: str) -> str:
+    return _parse_gff_attributes(attributes).get(key, "")
+
+
+def _derive_introns_from_exons(gff: pd.DataFrame) -> pd.DataFrame:
+    """Infer intron records from exon gaps in GFF3 transcript models.
+
+    Many gene annotation files, including Funannotate output, contain exon/CDS
+    rows but do not include explicit intron rows. The plotter expects introns
+    as intervals, so this creates synthetic feature=intron records by grouping
+    exons by their Parent transcript and taking the gaps between sorted exons.
+    Coordinates remain 1-based inclusive.
+    """
+    cols = ["seqid", "source", "feature", "start", "end", "score",
+            "strand", "phase", "attributes"]
+    if gff is None or gff.empty or "feature" not in gff:
+        return pd.DataFrame(columns=cols)
+
+    exons = gff[gff["feature"].astype(str).str.lower().eq("exon")].copy()
+    if exons.empty:
+        return pd.DataFrame(columns=cols)
+
+    exons["_parent"] = exons["attributes"].map(lambda x: _gff_attr(x, "Parent"))
+    exons["_id"] = exons["attributes"].map(lambda x: _gff_attr(x, "ID"))
+    # If Parent has multiple comma-separated transcripts, use the first one;
+    # this is enough to avoid mixing unrelated genes for coverage plotting.
+    exons["_parent"] = exons["_parent"].astype(str).str.split(",").str[0]
+    exons.loc[exons["_parent"].eq("") | exons["_parent"].isna(), "_parent"] = exons["_id"]
+
+    intron_rows = []
+    group_cols = ["seqid", "strand", "_parent"]
+    for (seqid, strand, parent), grp in exons.groupby(group_cols, dropna=False, sort=False):
+        if not parent or len(grp) < 2:
+            continue
+        intervals = sorted((int(s), int(e)) for s, e in grp[["start", "end"]].itertuples(index=False))
+        # Merge overlapping/adjacent exons before calculating gaps.
+        merged: List[List[int]] = []
+        for s, e in intervals:
+            if not merged or s > merged[-1][1] + 1:
+                merged.append([s, e])
+            else:
+                merged[-1][1] = max(merged[-1][1], e)
+        for idx, (left, right) in enumerate(zip(merged, merged[1:]), start=1):
+            intron_start = left[1] + 1
+            intron_end = right[0] - 1
+            if intron_start <= intron_end:
+                intron_rows.append({
+                    "seqid": str(seqid),
+                    "source": "derived_from_exon",
+                    "feature": "intron",
+                    "start": intron_start,
+                    "end": intron_end,
+                    "score": ".",
+                    "strand": str(strand),
+                    "phase": ".",
+                    "attributes": f"ID={parent}.derived_intron{idx};Parent={parent};Note=derived_from_exon_gaps",
+                })
+
+    if not intron_rows:
+        return pd.DataFrame(columns=cols)
+    return pd.DataFrame(intron_rows, columns=cols)
+
+
+def _prepare_gene_gff(gff: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """Normalize gene GFFs for plotting.
+
+    Keeps existing records and adds derived introns when the file has exon rows
+    but lacks explicit intron rows. This supports BRAKER/AUGUSTUS-style files
+    with intron features and Funannotate-style files with gene/mRNA/exon/CDS.
+    """
+    if gff is None or gff.empty:
+        return gff
+    if _has_feature(gff, "intron"):
+        return gff
+    derived = _derive_introns_from_exons(gff)
+    if derived.empty:
+        return gff
+    return pd.concat([gff, derived], ignore_index=True)
+
+
+def _window_overlap_fraction(
+    windows: pd.DataFrame,
+    intervals: pd.DataFrame,
+    contig: str,
+    feature_names: Optional[set[str]] = None,
+) -> np.ndarray:
+    """Return the fraction of each window covered by selected intervals.
+
+    A value of 0.0 means no overlap, 1.0 means the whole window is covered.
+    Overlapping intervals are merged per window so coverage is not double-counted.
+    """
+    out = np.zeros(len(windows), dtype=float)
+    if intervals is None or intervals.empty or windows.empty:
+        return out
+
+    q = intervals[intervals["seqid"].astype(str) == str(contig)].copy()
+    if feature_names is not None:
+        q = q[q["feature"].str.lower().isin(feature_names)]
+    if q.empty:
+        return out
+
+    w_start = windows["window_start"].to_numpy(dtype=float)
+    w_end = windows["window_end"].to_numpy(dtype=float)
+    x0 = np.nanmin(w_start)
+    x1 = np.nanmax(w_end)
+
+    q = q[(q["end"] >= x0) & (q["start"] <= x1)]
+    if q.empty:
+        return out
+
+    interval_pairs = [(float(s), float(e)) for s, e in q[["start", "end"]].itertuples(index=False)]
+    for i, (ws, we) in enumerate(zip(w_start, w_end)):
+        overlaps = []
+        for s, e in interval_pairs:
+            os = max(ws, s)
+            oe = min(we, e)
+            if oe >= os:
+                overlaps.append((os, oe))
+        if not overlaps:
+            continue
+        overlaps.sort()
+        merged = []
+        for os, oe in overlaps:
+            if not merged or os > merged[-1][1] + 1:
+                merged.append([os, oe])
+            else:
+                merged[-1][1] = max(merged[-1][1], oe)
+        covered = sum(oe - os + 1 for os, oe in merged)
+        out[i] = covered / max(1.0, we - ws + 1)
+    return out
+
+
+def _has_feature(gff: Optional[pd.DataFrame], feature_name: str) -> bool:
+    """True if a GFF dataframe contains at least one requested feature type."""
+    if gff is None or gff.empty or "feature" not in gff:
+        return False
+    return gff["feature"].astype(str).str.lower().eq(feature_name.lower()).any()
+
+_TE_SUPERFAMILIES = frozenset({
+    "ltr", "line", "sine", "dna", "rc", "helitron", "mite",
+    "dirs", "penelope", "maverick", "polinton", "crypton",
+    "retroposon", "retrotransposon", "transposon",
+})
+# Repeat classes that should NOT be plotted as TEs.
+_NON_TE_CLASSES = frozenset({
+    "simple_repeat", "low_complexity", "satellite",
+    "microsatellite", "minisatellite",
+    "trna", "rrna", "snrna", "scrna", "srna",
+    "rna", "buffer", "tandem_repeat", "unknown", 
+})
+
+def _repeat_target_class(attributes: str) -> str:
+    """Extract the repeat class from RepeatMasker-style GFF attributes.
+
+    Examples:
+        Target=rnd-4_family-377 LINE/L1 1 8472   -> LINE/L1
+        Target=(TGACC)n Simple_repeat 1 51       -> Simple_repeat
+        Target=foo SINE? 1 100                   -> SINE?
+    Returns "" if no class token can be recovered.
+    """
+    text = str(attributes or "")
+    m = re.search(r"(?:^|;)\s*Target=([^;]+)", text)
+    if not m:
+        return ""
+    target = m.group(1).strip()
+    parts = target.split()
+    if len(parts) >= 2:
+        return parts[1]
+    return ""
+
+def _classify_te(class_token: str) -> bool:
+    """True if `class_token` looks like a transposable-element class."""
+    if not class_token:
+        return False
+    t = class_token.strip().lower().rstrip("?")
+    superfam = t.split("/", 1)[0]
+    if superfam in _NON_TE_CLASSES or t in _NON_TE_CLASSES:
+        return False
+    return superfam in _TE_SUPERFAMILIES
+
+def _is_te_repeat_record(row: pd.Series) -> bool:
+    """Return True for TE-like repeat records, excluding simple/non-TE repeats.
+
+    Order of precedence:
+      1. RepeatMasker Target= class token in attributes (most reliable).
+      2. The GFF `feature` column itself if it already encodes a TE class
+         (some pipelines emit e.g. feature=LTR/Gypsy directly).
+    """
+    cls = _repeat_target_class(str(row.get("attributes", "")))
+    if cls:
+        return _classify_te(cls)
+    return _classify_te(str(row.get("feature", "")))
+
+def _filter_te_repeats(repeat_gff: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """Keep only transposable-element-like records from a repeat GFF dataframe."""
+    if repeat_gff is None:
+        return None
+    if repeat_gff.empty:
+        return repeat_gff
+    mask = repeat_gff.apply(_is_te_repeat_record, axis=1)
+    return repeat_gff.loc[mask].copy()
 
 def list_geves(marker: pd.DataFrame, bed: pd.DataFrame) -> List[str]:
     return sorted(
@@ -91,14 +350,12 @@ def infer_output_prefix(geve_names: List[str]) -> str:
             return name
     return "GEVE"
 
-
 def bp_tick_formatter(x: float) -> str:
     if abs(x) >= 1_000_000:
         return f"{x/1_000_000:.2f} Mb"
     if abs(x) >= 1_000:
         return f"{x/1_000:.0f} kb"
     return f"{int(x)} bp"
-
 
 def nice_ticks(start: int, end: int, n: int = 6) -> List[int]:
     span = max(1, end - start)
@@ -120,7 +377,6 @@ def nice_ticks(start: int, end: int, n: int = 6) -> List[int]:
     if end not in ticks:
         ticks.append(end)
     return sorted(set(ticks))
-
 
 def build_hallmark_palette(names: List[str]) -> Dict[str, str]:
     fixed = {
@@ -265,6 +521,44 @@ def draw_line_track(
         ax.spines[s].set_visible(False)
     ax.spines["left"].set_linewidth(1.0)
 
+def draw_bar_track(
+    ax,
+    starts: np.ndarray,
+    ends: np.ndarray,
+    values: np.ndarray,
+    color: str,
+    label: str,
+    background_color: str = "#fbfbfb",
+) -> None:
+    """Window-based bar track for annotation coverage distribution."""
+    clean = np.array(values, dtype=float)
+    valid = np.isfinite(clean)
+    ax.set_xlim(starts.min(), ends.max())
+    ax.set_facecolor(background_color)
+
+    ymax = float(np.nanmax(clean[valid])) if valid.any() else 1.0
+    if not np.isfinite(ymax) or ymax <= 0:
+        ymax = 1.0
+    ymax = min(1.0, max(0.05, ymax))
+    ax.set_ylim(0, ymax * 1.12)
+
+    widths = np.maximum(1.0, ends - starts + 1)
+    if valid.any():
+        ax.bar(
+            starts[valid], clean[valid], width=widths[valid], align="edge",
+            color=color, edgecolor="none", alpha=0.85, zorder=2,
+        )
+
+    ymin, ymax_axis = ax.get_ylim()
+    ticks = [ymin, ymax_axis]
+    ax.set_yticks(ticks)
+    ax.set_yticklabels([_format_axis_end_tick(t) for t in ticks], fontsize=8, color="black")
+    ax.set_ylabel(label, rotation=0, ha="right", va="center", fontsize=10, labelpad=8, color="black")
+    ax.tick_params(axis="y", labelsize=8, colors="black", length=8, width=1.0, direction="out")
+    ax.set_xticks([])
+    for s in ["top", "right", "bottom"]:
+        ax.spines[s].set_visible(False)
+    ax.spines["left"].set_linewidth(1.0)
 
 def draw_strip_track(
     ax,
@@ -288,7 +582,9 @@ def draw_strip_track(
     if vmin is None:
         vmin = np.nanmin(clean[valid]) if valid.any() else 0.0
 
-    base_colors = {"Greens": PLOT_COLORS["gvog"], "Purples": PLOT_COLORS["pfam"]}
+    base_colors = {"Greens": PLOT_COLORS["gvog"], "Purples": PLOT_COLORS["pfam"],
+                   "Intron": PLOT_COLORS["intron"], "Exon": PLOT_COLORS["exon"],
+                   "Repeat": PLOT_COLORS["repeat"]}
     color = base_colors.get(cmap, PLOT_COLORS["hallmark_default"])
 
     for s, e, v in zip(starts, ends, clean):
@@ -351,8 +647,9 @@ def add_legends(fig, hallmark_palette: Dict[str, str]) -> None:
         borderaxespad=0.0,
     )
 
-
-def plot_one_geve(marker: pd.DataFrame, bed: pd.DataFrame, geve_name: str):
+def plot_one_geve(marker: pd.DataFrame, bed: pd.DataFrame, geve_name: str,
+                  gene_gff: Optional[pd.DataFrame] = None,
+                  repeat_gff: Optional[pd.DataFrame] = None):
     """Build and return a Figure for one GEVE."""
     m = marker[marker["geve_name"] == geve_name].copy()
     b = bed[bed["geve_name"] == geve_name].copy().sort_values("window_start")
@@ -372,44 +669,81 @@ def plot_one_geve(marker: pd.DataFrame, bed: pd.DataFrame, geve_name: str):
     starts  = b["window_start"].to_numpy(dtype=float)
     ends    = b["window_end"].to_numpy(dtype=float)
 
-    # Rows: 0 viral score, 1 GC%, 2 GVOG, 3 Pfam, 4 hallmark ORFs + x-axis
-    fig = plt.figure(figsize=(FIG_WIDTH, FIG_HEIGHT), constrained_layout=False)
+    track_specs = [
+        ("line", "viral_score"),
+        ("line", "gc"),
+    ]
+    if _has_feature(gene_gff, "intron"):
+        track_specs.append(("bar", "intron"))
+    if _has_feature(gene_gff, "exon"):
+        track_specs.append(("bar", "exon"))
+    if repeat_gff is not None and not repeat_gff.empty:
+        track_specs.append(("strip", "repeat"))
+    track_specs.extend([
+        ("strip", "gvog"),
+        ("strip", "pfam"),
+        ("orf", "hallmark"),
+    ])
+
+    height_by_key = {
+        "viral_score": 1.12, "gc": 0.50,
+        "intron": 0.50, "exon": 0.50, "repeat": 0.30,
+        "gvog": 0.35, "pfam": 0.35, "hallmark": 0.26,
+    }
+    fig_height = FIG_HEIGHT + 0.32 * max(0, len(track_specs) - 5)
+    fig = plt.figure(figsize=(FIG_WIDTH, fig_height), constrained_layout=False)
     gs = fig.add_gridspec(
-        5, 1,
-        height_ratios=[1.12, 0.50, 0.35, 0.35, 0.26],
+        len(track_specs), 1,
+        height_ratios=[height_by_key[key] for _, key in track_specs],
         hspace=0.14,
     )
-    axs = [fig.add_subplot(gs[i, 0]) for i in range(5)]
+    axs = [fig.add_subplot(gs[i, 0]) for i in range(len(track_specs))]
 
     geve_start, geve_end = get_geve_interval(m, x0, x1)
 
-    draw_line_track(
-        axs[0], centers, b["rolling_score_mean"].to_numpy(dtype=float),
-        PLOT_COLORS["viral_score"], "Viral score",
-        baseline=0.0, fill=True, linewidth=1.2, ytick_values=[0],
-    )
-    draw_line_track(
-        axs[1], centers, b["gc"].to_numpy(dtype=float),
-        PLOT_COLORS["gc_content"], "GC (%)",
-        baseline=None, fill=False, linewidth=1.1,
-        ylim=(0, 100), midline=50, ytick_values=[0, 50, 100],
-    )
-    draw_strip_track(axs[2], starts, ends, b["gvog_hits"].to_numpy(dtype=float),
-                     "Greens", "GVOG hits", vmin=0.0)
-    draw_strip_track(axs[3], starts, ends, b["pfam_hits"].to_numpy(dtype=float),
-                     "Purples", "Pfam hits", vmin=0.0)
-    palette = draw_orf_track(axs[4], m, x0, x1)
+    palette = {}
+    for ax, (_, key) in zip(axs, track_specs):
+        if key == "viral_score":
+            draw_line_track(
+                ax, centers, b["rolling_score_mean"].to_numpy(dtype=float),
+                PLOT_COLORS["viral_score"], "Viral score",
+                baseline=0.0, fill=True, linewidth=1.2, ytick_values=[0],
+            )
+        elif key == "gc":
+            draw_line_track(
+                ax, centers, b["gc"].to_numpy(dtype=float),
+                PLOT_COLORS["gc_content"], "GC (%)",
+                baseline=None, fill=False, linewidth=1.1,
+                ylim=(0, 100), midline=50, ytick_values=[0, 50, 100],
+            )
+        elif key == "intron":
+            vals = _window_overlap_fraction(b, gene_gff, contig, {"intron"})
+            draw_bar_track(ax, starts, ends, vals, PLOT_COLORS["intron"], "Introns")
+        elif key == "exon":
+            vals = _window_overlap_fraction(b, gene_gff, contig, {"exon"})
+            draw_bar_track(ax, starts, ends, vals, PLOT_COLORS["exon"], "Exons")
+        elif key == "repeat":
+            vals = _window_overlap_fraction(b, repeat_gff, contig, None)
+            draw_strip_track(ax, starts, ends, vals, "Repeat", "TEs", vmin=0.0)
+        elif key == "gvog":
+            draw_strip_track(ax, starts, ends, b["gvog_hits"].to_numpy(dtype=float),
+                             "Greens", "GVOG hits", vmin=0.0)
+        elif key == "pfam":
+            draw_strip_track(ax, starts, ends, b["pfam_hits"].to_numpy(dtype=float),
+                             "Purples", "Pfam hits", vmin=0.0)
+        elif key == "hallmark":
+            palette = draw_orf_track(ax, m, x0, x1)
 
     for ax in axs:
         highlight_geve_region(ax, geve_start, geve_end)
         ax.set_xlim(x0, x1)
 
     ticks = nice_ticks(x0, x1, n=6)
-    axs[4].set_xticks(ticks)
-    axs[4].set_xticklabels([bp_tick_formatter(t) for t in ticks], fontsize=9)
-    axs[4].tick_params(axis="x", which="both", length=4, pad=5, bottom=True)
-    axs[4].spines["bottom"].set_visible(True)
-    axs[4].spines["bottom"].set_linewidth(0.6)
+    axs[-1].set_xticks(ticks)
+    axs[-1].set_xticklabels([bp_tick_formatter(t) for t in ticks], fontsize=9)
+    axs[-1].tick_params(axis="x", which="both", length=4, pad=5, bottom=True)
+    axs[-1].spines["bottom"].set_visible(True)
+    axs[-1].spines["bottom"].set_linewidth(0.6)
 
     geve_rows = m[m["feature"] == "GEVE"].copy()
     if not geve_rows.empty:
@@ -426,48 +760,63 @@ def plot_one_geve(marker: pd.DataFrame, bed: pd.DataFrame, geve_name: str):
 
 
 def main(argv: List[str]) -> int:
-    if len(argv) == 1 and argv[0].lower() in ("help", "-h", "--help"):
-        print(USAGE)
-        return 0
-    if len(argv) != 2:
-        print(USAGE, file=sys.stderr)
-        return 1
+    parser = argparse.ArgumentParser(
+        description="Plot findGEVE windowed viral score/GC/domain tracks.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Gene GFF adds exon coverage and intron coverage below GC. If intron rows are absent, introns are inferred from exon gaps per transcript. Repeat GFF adds a TE-only strip below GC.",
+    )
+    parser.add_argument("-g", "--gff", dest="gene_gff", type=Path,
+                        help="Gene annotation GFF3. Uses exon rows and explicit introns when present; otherwise infers introns from exon gaps per transcript.")
+    parser.add_argument("-r", "--repeat", dest="repeat_gff", type=Path,
+                        help="Repeat/TE annotation GFF3. Uses TE-like records only, e.g. LTR, LINE, SINE, DNA transposons, RC/Helitron, etc.")
+    parser.add_argument("markerout", type=Path, help="findGEVE markerout file")
+    parser.add_argument("bed", type=Path, help="findGEVE geve.bed window file")
+    args = parser.parse_args(argv)
 
-    markerout = Path(argv[0])
-    bed_path  = Path(argv[1])
+    markerout = args.markerout
+    bed_path = args.bed_path if hasattr(args, "bed_path") else args.bed
 
-    if not markerout.is_file():
-        print(f"Error: markerout file not found: {markerout}", file=sys.stderr)
-        return 1
-    if not bed_path.is_file():
-        print(f"Error: bed file not found: {bed_path}", file=sys.stderr)
-        return 1
+    for label, path in [
+        ("markerout", markerout),
+        ("bed", bed_path),
+        ("gene GFF", args.gene_gff),
+        ("repeat GFF", args.repeat_gff),
+    ]:
+        if path is not None and not path.is_file():
+            print(f"Error: {label} file not found: {path}", file=sys.stderr)
+            return 1
 
     marker = _read_markerout(markerout)
-    bed    = _read_bed(bed_path)
+    bed = _read_bed(bed_path)
+    gene_gff = _prepare_gene_gff(_read_gff(args.gene_gff)) if args.gene_gff is not None else None
+    repeat_gff = _filter_te_repeats(_read_gff(args.repeat_gff)) if args.repeat_gff is not None else None
 
     if marker.empty or bed.empty:
         print(f"Error: input file is empty (markerout={markerout}, bed={bed_path})", file=sys.stderr)
         return 1
+
+    if gene_gff is not None and gene_gff.empty:
+        print(f"Warning: gene GFF has no readable records: {args.gene_gff}", file=sys.stderr)
+    if repeat_gff is not None and repeat_gff.empty:
+        print(f"Warning: repeat GFF has no readable TE records after filtering: {args.repeat_gff}", file=sys.stderr)
 
     geves = list_geves(marker, bed)
     if not geves:
         print("Error: no GEVE entries found to plot.", file=sys.stderr)
         return 1
 
-    prefix  = infer_output_prefix(geves)
+    prefix = infer_output_prefix(geves)
     outpath = Path.cwd() / f"{prefix}.plot.pdf"
 
     with PdfPages(outpath) as pdf:
         for geve_name in geves:
-            fig = plot_one_geve(marker, bed, geve_name)
+            fig = plot_one_geve(marker, bed, geve_name, gene_gff=gene_gff, repeat_gff=repeat_gff)
             pdf.savefig(fig, bbox_inches="tight")
             plt.close(fig)
             print(f"Plotted {geve_name}")
 
     print(f"Wrote {outpath} ({len(geves)} page(s))")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
