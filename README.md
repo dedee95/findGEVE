@@ -53,7 +53,7 @@ This tool is fully written in Python and mostly uses third-party Python packages
 
 ```
 # install using pip (RECOMENDED)
-pip install numpy pandas pyfastx pyhmmer pyrodigal-gv
+pip install numpy pandas matplotlib pyfastx pyhmmer pyrodigal-gv
 
 # or install using conda
 conda install -c conda-forge -c bioconda numpy pandas pyfastx pyhmmer pyrodigal-gv
