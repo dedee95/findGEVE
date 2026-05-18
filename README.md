@@ -115,7 +115,8 @@ Optionals:
   -o, --outdir         Output directory                              [default: ./Result_<YYYYMMDD>]
   -t, --threads        CPU threads for ORF prediction and HMM search [default: 4]
   -e, --evalue         E-value cutoff for HMM searches               [default: 1e-5]
-  --blastn-jobs        Parallel TIR-detection workers                [default: --threads]
+  -p, --parallel       Parallel workers for seed clustering and
+                       TIR-detection (blastn) stages                 [default: --threads]
   -m, --min-hallmark-type
                        Minimum number of distinct hallmark types
                        required in the final retained GEVE           [default: 2]
