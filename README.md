@@ -146,6 +146,7 @@ Retained GEVE are sorted by contig and position, assigned IDs, and store to outp
 ├── Chlamydomonas.geve.cds        # Coding sequence for each retained GEVE
 ├── Chlamidomonas.func.tsv        # Functional annotation for each retained GEVE proteins
 ├── Chlamydomonas.geve.pep        # Protein sequence for each retained GEVE
+├── Chlamidomonas.plot.pdf        # Default visualization for each retained GEVE
 └── hallmark/                     # Per-hallmark type protein sequence (suitable for phylogenetic)
 	├── Chlamydomonas.d5.pep  
 	├── Chlamydomonas.rnapl.pep  
@@ -165,7 +166,7 @@ After you got the result from `findGEVE`, you can generate a visualization for e
 ./findGEVE_plot.py Chlamydomonas.markerout Chlamidomonas.geve.bed
 ```
 
-Here is the result example:
+Here is the result example: `Chlamidomonas.plot.pdf`
 
 ![findGEVE plot example](docs/findGEVE_plot_example.png)
 
