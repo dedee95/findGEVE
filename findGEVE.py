@@ -43,7 +43,8 @@ Optionals:
   -o, --outdir         Output directory                              [default: ./Result_<YYYYMMDD>]
   -t, --threads        CPU threads for ORF prediction and HMM search [default: 4]
   -e, --evalue         E-value cutoff for HMM searches               [default: 1e-5]
-  --blastn-jobs        Parallel TIR-detection workers                [default: --threads]
+  -p, --parallel       Parallel workers for seed clustering and
+                       TIR-detection (blastn) stages                 [default: --threads]
   -m, --min-hallmark-type
                        Minimum number of distinct hallmark types
                        required in the final retained GEVE           [default: 2]
@@ -1228,13 +1229,18 @@ def _process_cluster(task: dict) -> dict:
         geve_start      = best_tir.left_start
         geve_end        = best_tir.right_end
         boundary_method = "TIR"
-    else:
+    elif prescan_diag is not None and prescan_diag.get("applied"):
         geve_start = pre_start
         geve_end   = pre_end
-        boundary_method = (
-            "viral_score_boundary"
-            if (prescan_diag is not None and prescan_diag.get("applied"))
-            else "seed_cluster"
+        boundary_method = "viral_score_boundary"
+    else:
+        # No TIR and no viral-score extension applied: discard (seed_cluster fallback removed)
+        return dict(
+            status="skip", cluster_index=ci, contig=contig, log_msgs=log_msgs,
+            message=(
+                f"Cluster {clabel} ({contig}:{cstart:,}-{cend:,}): "
+                f"no TIR found and viral-score boundary not applied; discarded"
+            ),
         )
 
     geve_length = geve_end - geve_start + 1
@@ -2101,9 +2107,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    default=Path(f"Result_{datetime.now().strftime('%Y%m%d')}"))
     p.add_argument("-t", "--threads", type=int, default=4)
     p.add_argument("-e", "--evalue", type=float, default=DEFAULTS["evalue"])
-    p.add_argument("--blastn-jobs", type=int, default=None)
+    p.add_argument("-p", "--parallel", type=int, default=None)
     p.add_argument("-m", "--min-hallmark-type", type=int, default=DEFAULTS["min_hallmarks"])
-    p.add_argument("--blastn-threads",       type=int,   default=1)
     p.add_argument("-l", "--min-geve-len",   type=int,   default=DEFAULTS["min_geve_length"])
     p.add_argument("--cluster-merge-gap",    type=int,   default=DEFAULTS["cluster_merge_gap"])
 
@@ -2174,16 +2179,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     log_path = args.outdir / "run.log"
     setup_logging(log_path)
 
-    blastn_threads = max(1, int(args.blastn_threads))
-    if args.blastn_jobs is not None:
-        blastn_jobs = max(1, int(args.blastn_jobs))
-    else:
-        blastn_jobs = max(1, args.threads // blastn_threads)
+    parallel = max(1, int(args.parallel)) if args.parallel is not None else max(1, args.threads)
+    blastn_threads = max(1, args.threads // parallel)
 
     t0 = time.time()
     _LOG.info(
         f"findGEVE started | prefix='{args.prefix}' | "
-        f"threads={args.threads} | blastn_jobs={blastn_jobs} | "
+        f"threads={args.threads} | parallel={parallel} | "
         f"blastn_threads={blastn_threads} | "
         f"genome={args.genome}"
     )
@@ -2288,7 +2290,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         cfg["max_cluster_span"],
         rolling_by_orf_per_contig=rolling_by_orf_per_contig,
         host_fraction=cfg["host_territory_fraction"],
-        threads=args.threads,
+        threads=parallel,
     )
     if not clusters:
         _LOG.warning("No clusters passed hallmark-density criterion. No GEVE candidates.")
@@ -2318,25 +2320,24 @@ def main(argv: Optional[List[str]] = None) -> int:
             blastn_threads=blastn_threads,
         ))
 
-    if (args.blastn_jobs is None
-            and args.blastn_threads == 1
-            and len(tasks) < args.threads):
+    if args.parallel is None and len(tasks) < parallel:
+        # Fewer clusters than workers: reallocate spare threads to each blastn job
         per_job_threads = max(1, args.threads // max(1, len(tasks)))
-        if per_job_threads > 1:
+        if per_job_threads > blastn_threads:
             blastn_threads = per_job_threads
-            blastn_jobs = max(1, len(tasks))
+            parallel = max(1, len(tasks))
             for t in tasks:
                 t["blastn_threads"] = blastn_threads
             _LOG.info(
                 f"Auto-balance: {len(tasks)} cluster(s) < {args.threads} threads; "
-                f"using blastn_jobs={blastn_jobs}, blastn_threads={blastn_threads}"
+                f"using parallel={parallel}, blastn_threads={blastn_threads}"
             )
 
-    n_workers = max(1, min(blastn_jobs, len(tasks)))
+    n_workers = max(1, min(parallel, len(tasks)))
     _LOG.info(
         f"TIR/TSD/composition: dispatching {len(tasks)} cluster(s) "
         f"across {n_workers} parallel worker(s) "
-        f"(blastn_jobs={blastn_jobs}, blastn_threads={blastn_threads})"
+        f"(parallel={parallel}, blastn_threads={blastn_threads})"
     )
 
     executor = None
@@ -2416,12 +2417,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     n_tir          = sum(1 for g in raw_geves if g["has_tir"])
     n_score_bound  = sum(1 for g in raw_geves if g.get("boundary_method") == "viral_score_boundary")
-    n_seed_only    = sum(1 for g in raw_geves if g.get("boundary_method") == "seed_cluster")
     _LOG.info(
         f"Final: {len(raw_geves)} GEVE candidate(s) "
         f"({n_tir} TIR-bounded, "
-        f"{n_score_bound} viral-score boundary, "
-        f"{n_seed_only} seed-cluster only)"
+        f"{n_score_bound} viral-score boundary)"
     )
 
     # Stage 8: write outputs
