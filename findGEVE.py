@@ -42,9 +42,8 @@ Mandatory:
 Optionals:
   -o, --outdir         Output directory                              [default: ./Result_<YYYYMMDD>]
   -t, --threads        CPU threads for ORF prediction and HMM search [default: 4]
+  -p, --parallel       Parallel seed-clustering and TIR workers      [default: --threads]
   -e, --evalue         E-value cutoff for HMM searches               [default: 1e-5]
-  -p, --parallel       Parallel workers for seed clustering and
-                       TIR-detection (blastn) stages                 [default: --threads]
   -m, --min-hallmark-type
                        Minimum number of distinct hallmark types
                        required in the final retained GEVE           [default: 2]
@@ -75,6 +74,8 @@ DEFAULTS = dict(
     tir_max_len         = 10_000,
     tir_min_id          = 65.0, 
     tir_bracket_fraction= 1.0,
+    tir_viral_bracket_fraction = 0.80,
+    tir_viral_strong_fraction  = 0.10,
     tir_min_dinuc_entropy = 2.0,
     tir_max_kmer_fraction = 0.70,
     tir_max_tandem_fraction = 0.70,
@@ -756,13 +757,38 @@ def _tir_is_low_complexity(
 
 def _count_bracketed(
     tir: TirPair,
-    hallmark_intervals: List[Tuple[int, int]],
+    intervals: List[Tuple[int, int]],
 ) -> int:
-    """Count how many hallmark ORFs fall fully inside a TIR pair (genome-absolute)."""
-    return sum(
-        1 for hs, he in hallmark_intervals
-        if tir.left_start <= hs and he <= tir.right_end
-    )
+    """Count intervals fully inside a TIR pair (genome-absolute)."""
+    return sum(1 for s, e in intervals if tir.left_start <= s and e <= tir.right_end)
+
+def _viral_score_intervals(
+    contig_orfs: List[Orf],
+    rolling_by_orf: Dict[str, float],
+    span_start: int,
+    span_end: int,
+    cfg: dict,
+) -> List[Tuple[int, int, float]]:
+    positives = [
+        (o.start, o.end, rolling_by_orf.get(o.orf_id, 0.0))
+        for o in contig_orfs
+        if o.start >= span_start and o.end <= span_end
+        and rolling_by_orf.get(o.orf_id, 0.0) > 0.0
+    ]
+    if not positives:
+        return []
+    max_score = max(v for _, _, v in positives)
+    cutoff = max(0.0, max_score * cfg.get("tir_viral_strong_fraction", 0.10))
+    return [(s, e, v) for s, e, v in positives if v >= cutoff]
+
+def _viral_support_score(tir: TirPair, intervals: List[Tuple[int, int, float]]) -> Tuple[int, float]:
+    n = 0
+    score = 0.0
+    for s, e, v in intervals:
+        if tir.left_start <= s and e <= tir.right_end:
+            n += 1
+            score += max(0.0, v)
+    return n, score
 
 def select_best_tir(
     pairs: List[TirPair],
@@ -770,6 +796,7 @@ def select_best_tir(
     hallmark_intervals: List[Tuple[int, int]],
     cfg: dict,
     region_seq: Optional[str] = None,
+    viral_intervals: Optional[List[Tuple[int, int, float]]] = None,
 ) -> Tuple[Optional[TirPair], dict]:
     """Filter and rank TIR pairs. Returns (best_tir, diagnostics_dict)."""
     bracket_fraction = cfg.get("tir_bracket_fraction", 0.5)
@@ -780,6 +807,13 @@ def select_best_tir(
         if require_bracket else 0
     )
 
+    viral_intervals = viral_intervals or []
+    n_viral_total = len(viral_intervals)
+    viral_min_required = (
+        max(1, int(np.ceil(n_viral_total * cfg.get("tir_viral_bracket_fraction", 0.80))))
+        if n_viral_total else 0
+    )
+
     min_entropy        = cfg.get("tir_min_dinuc_entropy", 2.0)
     max_kmer_frac      = cfg.get("tir_max_kmer_fraction", 0.70)
     max_tandem_frac    = cfg.get("tir_max_tandem_fraction", 0.70)
@@ -788,11 +822,11 @@ def select_best_tir(
     diag = dict(
         n_raw=len(pairs),
         n_pass_insert=0, n_pass_len=0, n_pass_id=0,
-        n_pass_complexity=0, n_pass_bracket=0,
+        n_pass_complexity=0, n_pass_bracket=0, n_pass_viral=0,
         best_near_miss="",
     )
 
-    valid: List[Tuple[int, TirPair]] = []  
+    valid: List[Tuple[int, int, float, TirPair]] = []  
     near_miss_score = -1.0
 
     for t in pairs:
@@ -836,6 +870,9 @@ def select_best_tir(
             n_bracketed = 0
             ok_bracket  = True
 
+        n_viral_bracketed, viral_score = _viral_support_score(abs_tir, viral_intervals)
+        ok_viral = (n_viral_bracketed >= viral_min_required) if n_viral_total else True
+
         if ok_insert:
             diag["n_pass_insert"] += 1
         if ok_insert and ok_len:
@@ -846,8 +883,11 @@ def select_best_tir(
             diag["n_pass_complexity"] += 1
         if ok_insert and ok_len and ok_id and ok_complexity and ok_bracket:
             diag["n_pass_bracket"] += 1
+        if ok_insert and ok_len and ok_id and ok_complexity and ok_bracket and ok_viral:
+            diag["n_pass_viral"] += 1
 
-        score = (sum([ok_insert, ok_len, ok_id, ok_complexity, ok_bracket]) * 1e6
+        score = (sum([ok_insert, ok_len, ok_id, ok_complexity, ok_bracket, ok_viral]) * 1e6
+                 + (n_viral_bracketed * 1e4) + viral_score
                  + t.tir_identity * t.tir_length)
         if score > near_miss_score:
             near_miss_score = score
@@ -856,23 +896,25 @@ def select_best_tir(
                 f"id={t.tir_identity:.1f}% "
                 f"bracketed={n_bracketed}/{n_hallmarks_total} "
                 f"(need>={min_required}) "
+                f"viral={n_viral_bracketed}/{n_viral_total} "
+                f"(need>={viral_min_required}) "
                 f"complexity={complexity_reason} "
                 f"passed=[insert:{ok_insert},len:{ok_len},id:{ok_id},"
-                f"complexity:{ok_complexity},bracket:{ok_bracket}]"
+                f"complexity:{ok_complexity},bracket:{ok_bracket},viral:{ok_viral}]"
             )
-        if not (ok_insert and ok_len and ok_id and ok_complexity and ok_bracket):
+        if not (ok_insert and ok_len and ok_id and ok_complexity and ok_bracket and ok_viral):
             continue
 
-        valid.append((n_bracketed, abs_tir))
+        valid.append((n_bracketed, n_viral_bracketed, viral_score, abs_tir))
 
     if not valid:
         return None, diag
 
     valid.sort(
-        key=lambda x: (x[0], x[1].tir_identity, x[1].insert_size, x[1].tir_length),
+        key=lambda x: (x[0], x[1], x[2], x[3].tir_identity, x[3].insert_size, x[3].tir_length),
         reverse=True,
     )
-    best = valid[0][1]
+    best = valid[0][3]
     _LOG.debug(
         f"TIR selected: insert={best.insert_size:,} bp, "
         f"tir_len={best.tir_length} bp, id={best.tir_identity:.1f}%, "
@@ -1125,6 +1167,7 @@ def _process_cluster(task: dict) -> dict:
     genome_path    = task["genome_path"]
     contig_orfs    = task["contig_orfs"]
     blastn_threads = int(task.get("blastn_threads", 1))
+    rolling_by_orf  = task.get("rolling_by_orf", {})
 
     log_msgs: List[Tuple[str, str]] = []
     fa = pyfastx.Fasta(str(genome_path), build_index=True, uppercase=True)
@@ -1138,6 +1181,7 @@ def _process_cluster(task: dict) -> dict:
         for o in contig_orfs
         if o.hallmark is not None and o.start <= pre_end and o.end >= pre_start
     ]
+    viral_intervals = _viral_score_intervals(contig_orfs, rolling_by_orf, pre_start, pre_end, cfg)
 
     best_tir: Optional[TirPair] = None
     tir_note  = ""
@@ -1193,7 +1237,7 @@ def _process_cluster(task: dict) -> dict:
             best, diag = select_best_tir(
                 visible_pairs, region_offset=rstart_max,
                 hallmark_intervals=hallmark_intervals, cfg=cfg,
-                region_seq=region_seq_max,
+                region_seq=region_seq_max, viral_intervals=viral_intervals,
             )
             if best is not None:
                 best_tir   = best
@@ -1209,7 +1253,8 @@ def _process_cluster(task: dict) -> dict:
                     f"{diag['n_pass_len']} len, "
                     f"{diag['n_pass_id']} id, "
                     f"{diag['n_pass_complexity']} complexity, "
-                    f"{diag['n_pass_bracket']} bracket); "
+                    f"{diag['n_pass_bracket']} hallmark-bracket, "
+                    f"{diag['n_pass_viral']} viral-bracket); "
                     f"best near-miss: {diag['best_near_miss']}"
                 )
             if rstart == 1 and rend == clen:
@@ -1229,19 +1274,10 @@ def _process_cluster(task: dict) -> dict:
         geve_start      = best_tir.left_start
         geve_end        = best_tir.right_end
         boundary_method = "TIR"
-    elif prescan_diag is not None and prescan_diag.get("applied"):
+    else:
         geve_start = pre_start
         geve_end   = pre_end
         boundary_method = "viral_score_boundary"
-    else:
-        # No TIR and no viral-score extension applied: discard (seed_cluster fallback removed)
-        return dict(
-            status="skip", cluster_index=ci, contig=contig, log_msgs=log_msgs,
-            message=(
-                f"Cluster {clabel} ({contig}:{cstart:,}-{cend:,}): "
-                f"no TIR found and viral-score boundary not applied; discarded"
-            ),
-        )
 
     geve_length = geve_end - geve_start + 1
 
@@ -2106,9 +2142,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("-o", "--outdir", type=Path,
                    default=Path(f"Result_{datetime.now().strftime('%Y%m%d')}"))
     p.add_argument("-t", "--threads", type=int, default=4)
-    p.add_argument("-e", "--evalue", type=float, default=DEFAULTS["evalue"])
     p.add_argument("-p", "--parallel", type=int, default=None)
+    p.add_argument("-e", "--evalue", type=float, default=DEFAULTS["evalue"])
     p.add_argument("-m", "--min-hallmark-type", type=int, default=DEFAULTS["min_hallmarks"])
+    p.add_argument("--blastn-threads",       type=int,   default=1)
     p.add_argument("-l", "--min-geve-len",   type=int,   default=DEFAULTS["min_geve_length"])
     p.add_argument("--cluster-merge-gap",    type=int,   default=DEFAULTS["cluster_merge_gap"])
 
@@ -2151,10 +2188,10 @@ def run_geve_plot(marker_path: Path, bed_path: Path, outdir: Path, prefix: str) 
         return None
     for line in proc.stdout.splitlines():
         if line.strip():
-            _LOG.info(f"[plot] {line}")
+            _LOG.info(f"[PLOT] {line}")
     for line in proc.stderr.splitlines():
         if line.strip():
-            _LOG.warning(f"[plot] {line}")
+            _LOG.warning(f"[PLOT] {line}")
     if proc.returncode != 0:
         _LOG.warning(f"findGEVE_plot.py exited with code {proc.returncode}; no plot produced")
         return None
@@ -2179,8 +2216,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     log_path = args.outdir / "run.log"
     setup_logging(log_path)
 
-    parallel = max(1, int(args.parallel)) if args.parallel is not None else max(1, args.threads)
-    blastn_threads = max(1, args.threads // parallel)
+    parallel = max(1, int(args.parallel if args.parallel is not None else args.threads))
+    blastn_threads = max(1, int(args.blastn_threads))
+    blastn_jobs = parallel
 
     t0 = time.time()
     _LOG.info(
@@ -2200,6 +2238,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         f"tir_flank={cfg['tir_flank_start']:,}->{cfg['tir_flank_max']:,} "
         f"step {cfg['tir_flank_step']:,} bp | "
         f"tir_bracket_fraction={cfg['tir_bracket_fraction']} | "
+        f"tir_viral_bracket_fraction={cfg['tir_viral_bracket_fraction']} | "
         f"tir_min_len={cfg['tir_min_len']} bp | "
         f"host_territory_fraction={cfg['host_territory_fraction']}"
     )
@@ -2317,27 +2356,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             cfg=cfg,
             genome_path=str(args.genome),
             contig_orfs=orfs_by_contig.get(contig, []),
+            rolling_by_orf=rolling_by_orf_per_contig.get(contig, {}),
             blastn_threads=blastn_threads,
         ))
 
-    if args.parallel is None and len(tasks) < parallel:
-        # Fewer clusters than workers: reallocate spare threads to each blastn job
-        per_job_threads = max(1, args.threads // max(1, len(tasks)))
-        if per_job_threads > blastn_threads:
-            blastn_threads = per_job_threads
-            parallel = max(1, len(tasks))
-            for t in tasks:
-                t["blastn_threads"] = blastn_threads
-            _LOG.info(
-                f"Auto-balance: {len(tasks)} cluster(s) < {args.threads} threads; "
-                f"using parallel={parallel}, blastn_threads={blastn_threads}"
-            )
 
-    n_workers = max(1, min(parallel, len(tasks)))
+    n_workers = max(1, min(blastn_jobs, len(tasks)))
     _LOG.info(
         f"TIR/TSD/composition: dispatching {len(tasks)} cluster(s) "
         f"across {n_workers} parallel worker(s) "
-        f"(parallel={parallel}, blastn_threads={blastn_threads})"
+        f"(parallel={blastn_jobs}, blastn_threads={blastn_threads})"
     )
 
     executor = None
@@ -2419,8 +2447,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     n_score_bound  = sum(1 for g in raw_geves if g.get("boundary_method") == "viral_score_boundary")
     _LOG.info(
         f"Final: {len(raw_geves)} GEVE candidate(s) "
-        f"({n_tir} TIR-bounded, "
-        f"{n_score_bound} viral-score boundary)"
+        f"({n_tir} TIR-bounded, {n_score_bound} viral-score boundary)"
     )
 
     # Stage 8: write outputs
