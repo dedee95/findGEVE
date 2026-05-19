@@ -170,7 +170,7 @@ Here is the result example: `Chlamidomonas.plot.pdf`
 
 ![findGEVE plot example](docs/findGEVE_plot_example.png)
 
-Default output will be in multipage `.pdf` format. If you have more than one GEVE, you will have more than one plot. Each GEVE will have their own plot per page.
+Default output will be in multipage `.pdf` format. Each GEVE will have their own plot per page.
 
 ## 4. findGEVE algorithm detail
 This tool has six main steps for robust GEVE identification. It can be used on contig- or chromosome-level genome assemblies.
