@@ -41,20 +41,20 @@ PLOT_COLORS = {
     "geve_highlight": "#e6e6e6",
     "track_background": "#ffffff",
     "line_track_background": "#fbfbfb",
-    "hallmark_default": "#636363",
+    "hallmark_default": "#d62728",
     "hallmark_edge": "black",
 }
 
 PLOT_STYLE = {
-    "hallmark_star_size": 13,
+    "hallmark_star_size": 7,
     "hallmark_star_edge_width": 0.0,
     "geve_highlight_alpha": 0.55,
     "title_y": 0.955,
     "legend_y": 0.045,
 }
 
-FIG_WIDTH = 14.0
-FIG_HEIGHT = 8.5
+FIG_WIDTH = 12
+FIG_HEIGHT = 8
 
 _NATKEY_SPLIT = re.compile(r"(\d+)")
 
@@ -357,16 +357,16 @@ def nice_ticks(start: int, end: int, n: int = 6) -> List[int]:
 
 def build_hallmark_palette(names: List[str]) -> Dict[str, str]:
     fixed = {
-        "A32":   "#1f77b4",
-        "D5":    "#ff7f0e",
-        "PolB":  "#7f7f7f",
-        "RNAPL": "#9467bd",
-        "RNAPS": "#8c564b",
-        "RNR":   "#e377c2",
-        "SFII":  "#17becf",
-        "VLTF3": "#bcbd22",
-        "mRNAc": "#2ca02c",
-        "mcp":   "#d62728",
+        "A32":   "#6A4C93",
+        "D5":    "#565AA0",
+        "PolB":  "#4267AC",
+        "RNAPL": "#1982C4",
+        "RNAPS": "#36949D",
+        "RNR":   "#8AC926",
+        "SFII":  "#C5CA30",
+        "VLTF3": "#FFCA3A",
+        "mRNAc": "#FF924C",
+        "mcp":   "#FF595E",
     }
     missing = [n for n in names if n not in fixed]
     if missing:
@@ -627,7 +627,7 @@ def add_legends(fig, hallmark_palette: Dict[str, str]) -> None:
             markerfacecolor=hallmark_palette[name],
             markeredgecolor="none",
             markeredgewidth=PLOT_STYLE["hallmark_star_edge_width"],
-            markersize=10, label=name,
+            markersize=PLOT_STYLE["hallmark_star_size"], label=name,
         ))
     fig.legend(
         handles=handles,
@@ -916,12 +916,13 @@ def plot_one_geve_html(marker: pd.DataFrame, bed: pd.DataFrame, geve_name: str) 
 
     GVOG_Y0, GVOG_Y1 = 0.72, 0.93
     PFAM_Y0, PFAM_Y1 = 0.47, 0.68
-    HALLMARK_Y = 0.32
-    TIR_Y = 0.13
-    EV_THIN = 4
-    HALLMARK_SIZE = 9
-    TIR_MARKER_SIZE = 12
-    TIR_LABEL_SIZE = 11
+    MARKER_Y = 0.22
+    HALLMARK_Y = MARKER_Y
+    TIR_Y = MARKER_Y
+    EV_THIN = 2
+    TIR_MARKER_SIZE = 11
+    HALLMARK_SIZE = TIR_MARKER_SIZE
+    TIR_LABEL_SIZE = 12
     EV_LEGEND_WIDTH = 18
 
     _add_html_window_strip(
@@ -933,8 +934,8 @@ def plot_one_geve_html(marker: pd.DataFrame, bed: pd.DataFrame, geve_name: str) 
         PFAM_Y0, PFAM_Y1, PLOT_COLORS["pfam"], "Pfam hits",
     )
     _add_html_hallmark_stars(fig, hallmark, HALLMARK_Y, PLOT_COLORS["hallmark_default"], size=HALLMARK_SIZE)
-    _add_html_feature_segments(fig, tir_left, TIR_Y, "#238b45", EV_THIN)
-    _add_html_feature_segments(fig, tir_right, TIR_Y, "#238b45", EV_THIN)
+    _add_html_feature_segments(fig, tir_left, TIR_Y, "black", EV_THIN)
+    _add_html_feature_segments(fig, tir_right, TIR_Y, "black", EV_THIN)
 
     if not tir_left.empty:
         xs = ((tir_left["start"].astype(float) + tir_left["end"].astype(float)) / 2.0).tolist()
@@ -942,10 +943,10 @@ def plot_one_geve_html(marker: pd.DataFrame, bed: pd.DataFrame, geve_name: str) 
             x=xs,
             y=[TIR_Y] * len(xs),
             mode="markers+text",
-            marker=dict(symbol="triangle-right", size=TIR_MARKER_SIZE, color="#238b45", line=dict(color="black", width=0.7)),
+            marker=dict(symbol="triangle-right", size=TIR_MARKER_SIZE, color="black", line=dict(color="black", width=0.7)),
             text=["TIR"] * len(xs),
-            textposition="middle right",
-            textfont=dict(size=TIR_LABEL_SIZE, color="#238b45"),
+            textposition="middle left",
+            textfont=dict(size=TIR_LABEL_SIZE, color="black"),
             hovertemplate=_coord_hover(),
             showlegend=False,
         ), row=3, col=1)
@@ -955,10 +956,10 @@ def plot_one_geve_html(marker: pd.DataFrame, bed: pd.DataFrame, geve_name: str) 
             x=xs,
             y=[TIR_Y] * len(xs),
             mode="markers+text",
-            marker=dict(symbol="triangle-left", size=TIR_MARKER_SIZE, color="#238b45", line=dict(color="black", width=0.7)),
+            marker=dict(symbol="triangle-left", size=TIR_MARKER_SIZE, color="black", line=dict(color="black", width=0.7)),
             text=["TIR"] * len(xs),
-            textposition="middle left",
-            textfont=dict(size=TIR_LABEL_SIZE, color="#238b45"),
+            textposition="middle right",
+            textfont=dict(size=TIR_LABEL_SIZE, color="black"),
             hovertemplate=_coord_hover(),
             showlegend=False,
         ), row=3, col=1)
@@ -968,7 +969,7 @@ def plot_one_geve_html(marker: pd.DataFrame, bed: pd.DataFrame, geve_name: str) 
         marker=dict(
             symbol="square", size=12,
             color=PLOT_COLORS["geve_highlight"],
-            line=dict(width=0.5, color="#bdbdbd"),
+            line=dict(width=0.2, color="#d0d0d0"),
         ),
         name="GEVE", hoverinfo="skip", showlegend=True,
     ), row=3, col=1)
@@ -1128,7 +1129,7 @@ def plot_one_geve(marker: pd.DataFrame, bed: pd.DataFrame, geve_name: str,
     height_by_key = {
         "viral_score": 1.12, "gc": 0.50,
         "intron": 0.32, "exon": 0.32,
-        "repeat": 0.26, "gvog": 0.26, "pfam": 0.26, "hallmark": 0.26,
+        "repeat": 0.26, "gvog": 0.26, "pfam": 0.26, "hallmark": 0.18,
     }
     fig_height = FIG_HEIGHT + 0.32 * max(0, len(track_specs) - 5)
     fig = plt.figure(figsize=(FIG_WIDTH, fig_height), constrained_layout=False)
