@@ -47,7 +47,7 @@ PLOT_COLORS = {
 
 PLOT_STYLE = {
     "hallmark_star_size": 13,
-    "hallmark_star_edge_width": 0.55,
+    "hallmark_star_edge_width": 0.0,
     "geve_highlight_alpha": 0.55,
     "title_y": 0.955,
     "legend_y": 0.045,
@@ -427,9 +427,9 @@ def draw_orf_track(ax, feats: pd.DataFrame, x0: int, x1: int) -> Dict[str, str]:
         cx = (int(r["start"]) + int(r["end"])) / 2.0
         ax.plot(
             cx, y,
-            marker="*", color=color, markersize=PLOT_STYLE["hallmark_star_size"],
+            marker="o", color=color, markersize=PLOT_STYLE["hallmark_star_size"],
             markeredgewidth=PLOT_STYLE["hallmark_star_edge_width"],
-            markeredgecolor=PLOT_COLORS["hallmark_edge"],
+            markeredgecolor="none",
             zorder=7, linestyle="none",
         )
 
@@ -623,9 +623,9 @@ def add_legends(fig, hallmark_palette: Dict[str, str]) -> None:
     handles = []
     for name in sorted(hallmark_palette, key=_natural_key):
         handles.append(plt.Line2D(
-            [0], [0], marker="*", linestyle="none",
+            [0], [0], marker="o", linestyle="none",
             markerfacecolor=hallmark_palette[name],
-            markeredgecolor=PLOT_COLORS["hallmark_edge"],
+            markeredgecolor="none",
             markeredgewidth=PLOT_STYLE["hallmark_star_edge_width"],
             markersize=10, label=name,
         ))
@@ -849,7 +849,7 @@ def _add_html_hallmark_stars(fig: go.Figure, rows: pd.DataFrame, y: float, color
             x=xs,
             y=[y] * len(xs),
             mode="markers",
-            marker=dict(symbol="star", size=size, color=color, line=dict(width=0.7, color="black")),
+            marker=dict(symbol="circle", size=size, color=color, line=dict(width=0)),
             hovertemplate=_coord_hover(),
             showlegend=False,
         ),
@@ -984,7 +984,7 @@ def plot_one_geve_html(marker: pd.DataFrame, bed: pd.DataFrame, geve_name: str) 
     ), row=3, col=1)
     fig.add_trace(go.Scatter(
         x=[None], y=[None], mode="markers",
-        marker=dict(symbol="star", size=HALLMARK_SIZE, color=PLOT_COLORS["hallmark_default"], line=dict(width=0.7, color="black")),
+        marker=dict(symbol="circle", size=HALLMARK_SIZE, color=PLOT_COLORS["hallmark_default"], line=dict(width=0)),
         name="Hallmark", hoverinfo="skip", showlegend=True,
     ), row=3, col=1)
 
