@@ -74,8 +74,6 @@ DEFAULTS = dict(
     tir_max_len         = 10_000,
     tir_min_id          = 65.0, 
     tir_bracket_fraction= 1.0,
-    tir_viral_bracket_fraction = 0.80,
-    tir_viral_strong_fraction  = 0.10,
     tir_min_dinuc_entropy = 2.0,
     tir_max_kmer_fraction = 0.70,
     tir_max_tandem_fraction = 0.70,
@@ -762,56 +760,25 @@ def _count_bracketed(
     """Count intervals fully inside a TIR pair (genome-absolute)."""
     return sum(1 for s, e in intervals if tir.left_start <= s and e <= tir.right_end)
 
-def _viral_score_intervals(
-    contig_orfs: List[Orf],
-    rolling_by_orf: Dict[str, float],
-    span_start: int,
-    span_end: int,
-    cfg: dict,
-) -> List[Tuple[int, int, float]]:
-    positives = [
-        (o.start, o.end, rolling_by_orf.get(o.orf_id, 0.0))
-        for o in contig_orfs
-        if o.start >= span_start and o.end <= span_end
-        and rolling_by_orf.get(o.orf_id, 0.0) > 0.0
-    ]
-    if not positives:
-        return []
-    max_score = max(v for _, _, v in positives)
-    cutoff = max(0.0, max_score * cfg.get("tir_viral_strong_fraction", 0.10))
-    return [(s, e, v) for s, e, v in positives if v >= cutoff]
-
-def _viral_support_score(tir: TirPair, intervals: List[Tuple[int, int, float]]) -> Tuple[int, float]:
-    n = 0
-    score = 0.0
-    for s, e, v in intervals:
-        if tir.left_start <= s and e <= tir.right_end:
-            n += 1
-            score += max(0.0, v)
-    return n, score
-
 def select_best_tir(
     pairs: List[TirPair],
     region_offset: int,
     hallmark_intervals: List[Tuple[int, int]],
     cfg: dict,
     region_seq: Optional[str] = None,
-    viral_intervals: Optional[List[Tuple[int, int, float]]] = None,
 ) -> Tuple[Optional[TirPair], dict]:
-    """Filter and rank TIR pairs. Returns (best_tir, diagnostics_dict)."""
+    """Filter and rank TIR pairs. Returns (best_tir, diagnostics_dict).
+
+    TIR selection is based on structural TIR quality and hallmark bracketing only.
+    Rolling/net viral scores are deliberately not used here; viral-score based
+    boundary expansion is left to the TIR-less fallback and manual review.
+    """
     bracket_fraction = cfg.get("tir_bracket_fraction", 0.5)
     require_bracket  = bool(hallmark_intervals)
     n_hallmarks_total = len(hallmark_intervals)
     min_required = (
         max(1, int(np.ceil(n_hallmarks_total * bracket_fraction)))
         if require_bracket else 0
-    )
-
-    viral_intervals = viral_intervals or []
-    n_viral_total = len(viral_intervals)
-    viral_min_required = (
-        max(1, int(np.ceil(n_viral_total * cfg.get("tir_viral_bracket_fraction", 0.80))))
-        if n_viral_total else 0
     )
 
     min_entropy        = cfg.get("tir_min_dinuc_entropy", 2.0)
@@ -822,11 +789,11 @@ def select_best_tir(
     diag = dict(
         n_raw=len(pairs),
         n_pass_insert=0, n_pass_len=0, n_pass_id=0,
-        n_pass_complexity=0, n_pass_bracket=0, n_pass_viral=0,
+        n_pass_complexity=0, n_pass_bracket=0,
         best_near_miss="",
     )
 
-    valid: List[Tuple[int, int, float, TirPair]] = []  
+    valid: List[Tuple[int, TirPair]] = []
     near_miss_score = -1.0
 
     for t in pairs:
@@ -870,9 +837,6 @@ def select_best_tir(
             n_bracketed = 0
             ok_bracket  = True
 
-        n_viral_bracketed, viral_score = _viral_support_score(abs_tir, viral_intervals)
-        ok_viral = (n_viral_bracketed >= viral_min_required) if n_viral_total else True
-
         if ok_insert:
             diag["n_pass_insert"] += 1
         if ok_insert and ok_len:
@@ -883,11 +847,9 @@ def select_best_tir(
             diag["n_pass_complexity"] += 1
         if ok_insert and ok_len and ok_id and ok_complexity and ok_bracket:
             diag["n_pass_bracket"] += 1
-        if ok_insert and ok_len and ok_id and ok_complexity and ok_bracket and ok_viral:
-            diag["n_pass_viral"] += 1
 
-        score = (sum([ok_insert, ok_len, ok_id, ok_complexity, ok_bracket, ok_viral]) * 1e6
-                 + (n_viral_bracketed * 1e4) + viral_score
+        score = (sum([ok_insert, ok_len, ok_id, ok_complexity, ok_bracket]) * 1e6
+                 + (n_bracketed * 1e4)
                  + t.tir_identity * t.tir_length)
         if score > near_miss_score:
             near_miss_score = score
@@ -896,25 +858,29 @@ def select_best_tir(
                 f"id={t.tir_identity:.1f}% "
                 f"bracketed={n_bracketed}/{n_hallmarks_total} "
                 f"(need>={min_required}) "
-                f"viral={n_viral_bracketed}/{n_viral_total} "
-                f"(need>={viral_min_required}) "
                 f"complexity={complexity_reason} "
                 f"passed=[insert:{ok_insert},len:{ok_len},id:{ok_id},"
-                f"complexity:{ok_complexity},bracket:{ok_bracket},viral:{ok_viral}]"
+                f"complexity:{ok_complexity},bracket:{ok_bracket}]"
             )
-        if not (ok_insert and ok_len and ok_id and ok_complexity and ok_bracket and ok_viral):
+        if not (ok_insert and ok_len and ok_id and ok_complexity and ok_bracket):
             continue
 
-        valid.append((n_bracketed, n_viral_bracketed, viral_score, abs_tir))
+        valid.append((n_bracketed, abs_tir))
 
     if not valid:
         return None, diag
 
     valid.sort(
-        key=lambda x: (x[0], x[1], x[2], x[3].tir_identity, x[3].insert_size, x[3].tir_length),
+        key=lambda x: (
+            x[0],
+            x[1].tir_identity,
+            x[1].insert_size,
+            x[1].tir_length,
+            x[1].score,
+        ),
         reverse=True,
     )
-    best = valid[0][3]
+    best = valid[0][1]
     _LOG.debug(
         f"TIR selected: insert={best.insert_size:,} bp, "
         f"tir_len={best.tir_length} bp, id={best.tir_identity:.1f}%, "
@@ -973,12 +939,19 @@ def gc_of_seq(seq: str) -> float:
     return float(100.0 * gc / valid) if valid > 0 else float("nan")
 
 def viz_flank_size(geve_length: int) -> int:
-    """Adaptive flank by GEVE length tier (100k / 200k / 300k)."""
-    if geve_length < 300_000:
+    """Adaptive visualization flank size used by markerout and geve.bed outputs."""
+    geve_length = max(1, int(geve_length))
+    if geve_length < 100_000:
         return 100_000
-    if geve_length < 1_000_000:
+    if geve_length < 300_000:
         return 200_000
-    return 300_000
+    if geve_length < 400_000:
+        return 300_000
+    if geve_length < 600_000:
+        return 400_000
+    if geve_length < 1_000_000:
+        return 500_000
+    return 700_000
 
 # Stage 8: per-cluster worker (TIR + TSD + GC)
 def extend_tirless_boundaries(
@@ -1181,8 +1154,6 @@ def _process_cluster(task: dict) -> dict:
         for o in contig_orfs
         if o.hallmark is not None and o.start <= pre_end and o.end >= pre_start
     ]
-    viral_intervals = _viral_score_intervals(contig_orfs, rolling_by_orf, pre_start, pre_end, cfg)
-
     best_tir: Optional[TirPair] = None
     tir_note  = ""
     flank_used = 0
@@ -1237,7 +1208,7 @@ def _process_cluster(task: dict) -> dict:
             best, diag = select_best_tir(
                 visible_pairs, region_offset=rstart_max,
                 hallmark_intervals=hallmark_intervals, cfg=cfg,
-                region_seq=region_seq_max, viral_intervals=viral_intervals,
+                region_seq=region_seq_max,
             )
             if best is not None:
                 best_tir   = best
@@ -1253,8 +1224,7 @@ def _process_cluster(task: dict) -> dict:
                     f"{diag['n_pass_len']} len, "
                     f"{diag['n_pass_id']} id, "
                     f"{diag['n_pass_complexity']} complexity, "
-                    f"{diag['n_pass_bracket']} hallmark-bracket, "
-                    f"{diag['n_pass_viral']} viral-bracket); "
+                    f"{diag['n_pass_bracket']} hallmark-bracket); "
                     f"best near-miss: {diag['best_near_miss']}"
                 )
             if rstart == 1 and rend == clen:
@@ -2238,7 +2208,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         f"tir_flank={cfg['tir_flank_start']:,}->{cfg['tir_flank_max']:,} "
         f"step {cfg['tir_flank_step']:,} bp | "
         f"tir_bracket_fraction={cfg['tir_bracket_fraction']} | "
-        f"tir_viral_bracket_fraction={cfg['tir_viral_bracket_fraction']} | "
         f"tir_min_len={cfg['tir_min_len']} bp | "
         f"host_territory_fraction={cfg['host_territory_fraction']}"
     )
