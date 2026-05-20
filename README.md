@@ -47,6 +47,7 @@ This tool is fully written in Python and mostly uses third-party Python packages
 - `numpy` v1.24 or hinger
 - `pandas`  v2.0 or hinger
 - `matplotlib` v3.0.0 or hinger
+- `openpyxl` v3.0.10 or hinger
 - `pyfastx` v2.3.0
 - `pyhmmer` v0.12.0
 - `pyrodigal-gv` v0.3.2
