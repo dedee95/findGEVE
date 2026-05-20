@@ -57,7 +57,7 @@ This tool is fully written in Python and mostly uses third-party Python packages
 pip install numpy pandas matplotlib pyfastx pyhmmer pyrodigal-gv
 
 # or install using conda
-conda install -c conda-forge -c bioconda numpy pandas pyfastx pyhmmer pyrodigal-gv
+conda install -c conda-forge -c bioconda numpy pandas matplotlib plotly openpyxl pyfastx pyhmmer pyrodigal-gv
 ```
 ### 1.2 External Python packages:
 - BLAST+ with `blastn` v2.17.0+ available in `$PATH`
