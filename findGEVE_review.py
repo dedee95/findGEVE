@@ -46,7 +46,7 @@ Usage:
 Review actions:
   unchanged   Keep the original GEVE call.
   remove      Remove the GEVE from reviewed outputs.
-  change      Use review_start and review_end as a curated candidate interval.
+  change      Use review_start/review_end as curated boundaries. If one side is blank, the original coordinate is kept.
 """
 
 _LOG = logging.getLogger("findGEVE_review")
@@ -196,13 +196,13 @@ def infer_prefix(summary_path: Path, summary: Optional[pd.DataFrame] = None) -> 
 
 def default_outdir(base: Optional[Path]) -> Path:
     root = base if base is not None else Path.cwd()
-    date_tag = datetime.now().strftime("%Y-%m-%d")
-    out = root / f"review_{date_tag}"
+    date_tag = datetime.now().strftime("%Y%m%d")
+    out = root / f"Review_{date_tag}"
     if not out.exists():
         return out
     idx = 1
     while True:
-        cand = root / f"review_{date_tag}_{idx:02d}"
+        cand = root / f"Review_{date_tag}_{idx:02d}"
         if not cand.exists():
             return cand
         idx += 1
@@ -325,7 +325,7 @@ def make_template(summary_path: Path, overwrite: bool = False) -> Path:
                 cell.fill = locked_fill
                 cell.protection = Protection(locked=True)
 
-    widths = {"A": 28, "B": 14, "C": 28, "D": 16, "E": 16, "F": 16, "G": 16}
+    widths = {"A": 28, "B": 14, "C": 12, "D": 16, "E": 16, "F": 16, "G": 16}
     for col, width in widths.items():
         ws.column_dimensions[col].width = width
     ws.freeze_panes = "A2"
@@ -339,7 +339,7 @@ def make_template(summary_path: Path, overwrite: bool = False) -> Path:
         "Allowed action values: unchanged, remove, change",
         "unchanged: keep the original GEVE call. Leave review_start/review_end empty.",
         "remove: drop the GEVE from reviewed outputs. Leave review_start/review_end empty.",
-        "change: fill review_start and review_end. These coordinates become the curated candidate interval.",
+        "change: fill review_start and/or review_end. Blank side uses the original coordinate.",
         "Use the Plotly HTML coordinate-review plot to click and copy boundary coordinates.",
     ]
     for line in lines:
@@ -425,12 +425,33 @@ def validate_review(review: pd.DataFrame, summary: pd.DataFrame) -> Tuple[pd.Dat
 
         review_start = _safe_int(row.get("review_start"))
         review_end = _safe_int(row.get("review_end"))
+        has_review_bounds = review_start is not None or review_end is not None
+
+        if action == "unchanged" and has_review_bounds:
+            action = "change"
+            warnings.append(
+                f"row {excel_row} ({geve_name}): review_start/review_end were filled while action was unchanged; "
+                "treated as change"
+            )
+
         if action == "change":
-            if review_start is None or review_end is None:
-                errors.append(f"row {excel_row} ({geve_name}): change requires review_start and review_end")
+            if review_start is None and review_end is not None:
+                review_start = orig_start
+                warnings.append(
+                    f"row {excel_row} ({geve_name}): review_start was blank for action=change; "
+                    "used original_start"
+                )
+            if review_end is None and review_start is not None:
+                review_end = orig_end
+                warnings.append(
+                    f"row {excel_row} ({geve_name}): review_end was blank for action=change; "
+                    "used original_end"
+                )
+            if review_start is None and review_end is None:
+                errors.append(f"row {excel_row} ({geve_name}): change requires review_start and/or review_end")
             elif review_start >= review_end:
                 errors.append(f"row {excel_row} ({geve_name}): review_start must be smaller than review_end")
-        elif review_start is not None or review_end is not None:
+        elif has_review_bounds:
             warnings.append(f"row {excel_row} ({geve_name}): review_start/review_end ignored for action={action}")
 
         clean_rows.append(dict(
@@ -554,7 +575,8 @@ def select_best_tir(pairs: List[TirPair], region_offset: int, candidate_start: i
         valid.append((bracketed, -edge_distance, abs_t.tir_identity, abs_t.tir_length, abs_t.score, abs_t))
     if not valid:
         return None
-    valid.sort(reverse=True)
+
+    valid.sort(key=lambda x: x[:-1], reverse=True)
     return valid[0][-1]
 
 def find_tsd(left_flank: str, right_flank: str, k_min: int, k_max: int, max_slide: int) -> Optional[Tsd]:
@@ -1062,7 +1084,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_apply.add_argument("--genome", type=Path, help="Genome FASTA; gzip is acceptable")
     p_apply.add_argument("--prefix", help="Output prefix; inferred from summary when omitted")
     p_apply.add_argument("--outdir", type=Path, help="Output review directory")
-    p_apply.add_argument("--outbase", type=Path, help="Base directory for automatic review_<date> output folder")
+    p_apply.add_argument("--outbase", type=Path, help="Base directory for automatic Review_<YYYYMMDD> output folder")
     p_apply.add_argument("--overwrite", action="store_true", help="Allow writing into a non-empty output directory")
     p_apply.add_argument("--no-plot", action="store_true", help="Skip automatic plotting")
     p_apply.add_argument("-t", "--threads", type=int, default=1, help="blastn threads [default: 1]")
