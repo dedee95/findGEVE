@@ -148,16 +148,11 @@ Retained GEVE are sorted by contig and position, assigned IDs, and store to outp
 ├── Chlamidomonas.func.tsv        # Functional annotation for each retained GEVE proteins
 ├── Chlamydomonas.geve.pep        # Protein sequence for each retained GEVE
 ├── Chlamidomonas.plot.pdf        # Default visualization for each retained GEVE
+├── Chlamidomonas.plot.html       # Interactive visualization for boundary adjustment
 └── hallmark/                     # Per-hallmark type protein sequence (suitable for phylogenetic)
 	├── Chlamydomonas.d5.pep  
 	├── Chlamydomonas.rnapl.pep  
-	├── Chlamydomonas.polb.pep  
-	├── Chlamydomonas.rnaps.pep  
-	├── Chlamydomonas.mcp.pep  
-	├── Chlamydomonas.rnr.pep  
-	├── Chlamydomonas.a32.pep  
-	├── Chlamydomonas.mrnac.pep  
-	└── Chlamydomonas.vltf3.pep
+	└── ...
 ```
 
 A predicted GEVE candidate is supported by the presence of multiple NCLDV-like hallmark genes. The presence of TIR and TSD also provide additional structural evidence. However,  candidates GEVE can still be reported without TIRs then it will use viral-score to determine it's boundary.
