@@ -512,7 +512,6 @@ def draw_line_track(
 
     ax.set_yticks(ticks)
     ax.set_yticklabels([_format_axis_end_tick(t) for t in ticks], fontsize=8, color="black")
-    # ylabel is forced black regardless of line colour
     ax.set_ylabel(label, rotation=0, ha="right", va="center", fontsize=10, labelpad=8, color="black")
     ax.tick_params(axis="y", labelsize=8, colors="black", length=8, width=1.0, direction="out")
     ax.set_xticks([])
@@ -1041,7 +1040,14 @@ h1 {{ font-size: 22px; margin: 0 0 8px 0; }}
 .controls {{ display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 12px 0 10px 0; }}
 select {{ font-size: 14px; padding: 4px 8px; min-width: 260px; }}
 button {{ font-size: 14px; padding: 5px 10px; cursor: pointer; }}
-#coordBox {{ font-size: 16px; font-weight: bold; padding: 6px 10px; background: #f3f3f3; border-radius: 4px; }}
+button.copied {{ background: #198754; color: #ffffff; border-color: #198754; }}
+#coordBox {{ font-size: 16px; font-weight: bold; padding: 6px 10px; background: #f3f3f3; border: 1px solid transparent; border-radius: 4px; transition: background-color 160ms ease, color 160ms ease, border-color 160ms ease, box-shadow 160ms ease; }}
+#coordBox.copied {{ background: #d1f7d6; color: #064e1b; border-color: #198754; box-shadow: 0 0 0 3px rgba(25,135,84,0.25); animation: copiedPulse 700ms ease-out; }}
+@keyframes copiedPulse {{
+  0% {{ transform: scale(1); }}
+  35% {{ transform: scale(1.025); }}
+  100% {{ transform: scale(1); }}
+}}
 .note {{ color: #555; max-width: 950px; line-height: 1.35; }}
 #plot {{ width: 100%; min-height: 680px; }}
 </style>
@@ -1059,6 +1065,30 @@ button {{ font-size: 14px; padding: 5px 10px; cursor: pointer; }}
 <script>
 const figures = {figures_json};
 let currentCoord = "";
+let copyFeedbackTimer = null;
+function showCopyFeedback() {{
+  const coordBox = document.getElementById('coordBox');
+  const copyButton = document.getElementById('copyButton');
+  coordBox.classList.remove('copied');
+  void coordBox.offsetWidth;
+  coordBox.classList.add('copied');
+  copyButton.classList.add('copied');
+  copyButton.textContent = 'Copied!';
+  if (copyFeedbackTimer) window.clearTimeout(copyFeedbackTimer);
+  copyFeedbackTimer = window.setTimeout(() => {{
+    coordBox.classList.remove('copied');
+    copyButton.classList.remove('copied');
+    copyButton.textContent = 'Copy';
+  }}, 900);
+}}
+function copyCurrentCoord() {{
+  if (!currentCoord) return;
+  if (navigator.clipboard && navigator.clipboard.writeText) {{
+    navigator.clipboard.writeText(currentCoord).then(showCopyFeedback).catch(showCopyFeedback);
+  }} else {{
+    showCopyFeedback();
+  }}
+}}
 function renderSelected() {{
   const key = document.getElementById('geveSelect').value;
   const fig = figures[key];
@@ -1072,15 +1102,12 @@ function renderSelected() {{
       if (!Number.isFinite(rounded)) return;
       currentCoord = String(rounded);
       document.getElementById('coordBox').textContent = 'Clicked coordinate: ' + rounded.toLocaleString();
-      if (navigator.clipboard && navigator.clipboard.writeText) {{ navigator.clipboard.writeText(currentCoord).catch(() => {{}}); }}
+      copyCurrentCoord();
     }});
   }});
 }}
 document.getElementById('geveSelect').addEventListener('change', renderSelected);
-document.getElementById('copyButton').addEventListener('click', function() {{
-  if (!currentCoord) return;
-  if (navigator.clipboard && navigator.clipboard.writeText) {{ navigator.clipboard.writeText(currentCoord).catch(() => {{}}); }}
-}});
+document.getElementById('copyButton').addEventListener('click', copyCurrentCoord);
 renderSelected();
 </script>
 </body>
