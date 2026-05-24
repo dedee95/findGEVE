@@ -44,9 +44,9 @@ Optionals:
   -t, --threads        CPU threads for ORF prediction and HMM search [default: 4]
   -p, --parallel       Parallel seed-clustering and TIR workers      [default: --threads]
   -e, --evalue         E-value cutoff for HMM searches               [default: 1e-5]
-  -m, --min-hallmark-type
-                       Minimum number of distinct hallmark types
-                       required in the final retained GEVE           [default: 2]
+  -m, --min-hallmark
+                       Minimum number of hallmark copies
+                       required in the final retained GEVE           [default: 3]
   -l, --min-geve-len   Minimum GEVE length                           [default: 50_000]
   --cluster-merge-gap  Maximum gap (bp) between same-contig clusters [default: 100_000]
   -h, --help           Show this help and exit
@@ -59,7 +59,7 @@ DEFAULTS = dict(
     min_contig          = 50_000,
     min_geve_length     = 50_000,
     min_hallmarks_seed  = 1,
-    min_hallmarks       = 2,
+    min_hallmarks       = 3,
     seed_window         = 300_000,
     cluster_merge_gap   = 100_000,
     max_cluster_span    = 2_000_000,
@@ -67,7 +67,7 @@ DEFAULTS = dict(
     rolling_window      = 15,
     tir_flank_start     = 100_000,
     tir_flank_step      = 100_000,
-    tir_flank_max       = 200_000,
+    tir_flank_max       = 100_000,
     tir_min_insert      = 30_000,  
     tir_max_insert      = 1_500_000,
     tir_min_len         = 10,
@@ -2114,27 +2114,22 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("-t", "--threads", type=int, default=4)
     p.add_argument("-p", "--parallel", type=int, default=None)
     p.add_argument("-e", "--evalue", type=float, default=DEFAULTS["evalue"])
-    p.add_argument("-m", "--min-hallmark-type", type=int, default=DEFAULTS["min_hallmarks"])
+    p.add_argument("-m", "--min-hallmark", dest="min_hallmark", type=int,
+                   default=DEFAULTS["min_hallmarks"])
     p.add_argument("--blastn-threads",       type=int,   default=1)
     p.add_argument("-l", "--min-geve-len",   type=int,   default=DEFAULTS["min_geve_length"])
     p.add_argument("--cluster-merge-gap",    type=int,   default=DEFAULTS["cluster_merge_gap"])
 
     return p.parse_args(argv)
 
-def _write_empty_outputs(outdir: Path, prefix: str, genome_path: Path) -> None:
-    (outdir / f"{prefix}.geve.fna").write_text("")
-    (outdir / f"{prefix}.geve.pep").write_text("")
-    (outdir / f"{prefix}.geve.cds").write_text("")
-    (outdir / f"{prefix}.markerout").write_text(
-        "contig\tgeve_name\tfeature\tname\tstart\tend\tstrand\te_value\tscore\n"
+def _write_no_geve_notice(outdir: Path, genome_path: Path, reason: str) -> None:
+    notice_path = outdir / "No_GEVE_was_found.txt"
+    notice_path.write_text(
+        "No GEVE was found in this run.\n"
+        "Please read run.log in this output directory for the full details.\n"
+        f"Reason: {reason}\n"
     )
-    (outdir / f"{prefix}.geve.bed").write_text(
-        "contig_id\twindow_start\twindow_end\tgeve_name\trel_start\trel_end\t"
-        "region_type\tgc\trolling_score_mean\tn_orfs\tgvog_hits\tpfam_hits\n"
-    )
-    (outdir / f"{prefix}.geve.gff3").write_text("##gff-version 3\n")
-    pd.DataFrame().to_csv(outdir / f"{prefix}.summary.tsv", sep="\t", index=False)
-    pd.DataFrame().to_csv(outdir / f"{prefix}.func.tsv", sep="\t", index=False)
+    _LOG.output(f"No-GEVE notice -> {notice_path}")
     log_run_summary([], genome_path)
 
 def run_geve_plot(marker_path: Path, bed_path: Path, outdir: Path, prefix: str) -> Optional[Path]:
@@ -2178,7 +2173,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     cfg = dict(DEFAULTS)
     cfg["min_geve_length"]      = args.min_geve_len
-    cfg["min_hallmarks"]        = args.min_hallmark_type
+    cfg["min_hallmarks"]        = args.min_hallmark
     cfg["cluster_merge_gap"]    = args.cluster_merge_gap
     cfg["evalue"]               = args.evalue
 
@@ -2270,7 +2265,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     hallmark_contigs = set(contig2hallmark_hits.keys())
     if not hallmark_contigs:
         _LOG.warning("No NCLDV hallmark hits detected. No GEVE candidates.")
-        _write_empty_outputs(args.outdir, args.prefix, args.genome)
+        _write_no_geve_notice(args.outdir, args.genome, "No NCLDV hallmark hits detected.")
         return 0
 
     _LOG.info(f"Hallmark-positive contigs: {len(hallmark_contigs):,}")
@@ -2302,7 +2297,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     if not clusters:
         _LOG.warning("No clusters passed hallmark-density criterion. No GEVE candidates.")
-        _write_empty_outputs(args.outdir, args.prefix, args.genome)
+        _write_no_geve_notice(args.outdir, args.genome, "No clusters passed the hallmark-density criterion.")
         return 0
 
     # Stage 3b: viral-score pre-scan + post-extension same-contig merge
@@ -2394,18 +2389,48 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Stage 7.5b: resolve overlapping GEVE spans (drop spurious TIRs, merge regions)
     raw_geves = _resolve_overlapping_geves(raw_geves, fa, orfs_by_contig)
 
-    # Stage 7.6: final QC — require >= min_hallmarks distinct types on the merged GEVE
+    # Stage 7.6: final QC — require >= min_hallmarks total hallmark copies
     before = len(raw_geves)
     raw_geves = [
         g for g in raw_geves
-        if len(g["hallmarks_present"]) >= cfg["min_hallmarks"]
+        if g["n_hallmarks"] >= cfg["min_hallmarks"]
     ]
     n_dropped = before - len(raw_geves)
     if n_dropped:
         _LOG.info(
             f"Final hallmark filter: dropped {n_dropped} GEVE(s) with "
-            f"< {cfg['min_hallmarks']} distinct hallmark types"
+            f"< {cfg['min_hallmarks']} total hallmark copies"
         )
+
+    # Stage 7.7: final QC — discard regions dominated by negative net score
+    before = len(raw_geves)
+    kept_geves = []
+    for g in raw_geves:
+        orfs = g.get("orfs", [])
+        if not orfs:
+            kept_geves.append(g)
+            continue
+        neg = sum(1 for o in orfs if o.net_score < 0)
+        neg_fraction = neg / len(orfs)
+        if neg_fraction > 0.5:
+            _LOG.info(
+                f"Final net-score filter: dropped GEVE candidate on "
+                f"{g['contig']}:{g['geve_start']:,}-{g['geve_end']:,} "
+                f"because {neg}/{len(orfs)} ORFs ({neg_fraction:.1%}) have net_score < 0"
+            )
+            continue
+        kept_geves.append(g)
+    raw_geves = kept_geves
+    n_dropped = before - len(raw_geves)
+    if n_dropped:
+        _LOG.info(
+            f"Final net-score filter: dropped {n_dropped} GEVE(s) dominated by net_score < 0"
+        )
+
+    if not raw_geves:
+        _LOG.warning("No GEVE candidates remained after final QC filters.")
+        _write_no_geve_notice(args.outdir, args.genome, "No GEVE candidates remained after final QC filters.")
+        return 0
 
     # Sort and assign final IDs by natural contig order, then position
     raw_geves.sort(key=lambda g: (_natural_key(g["contig"]), g["geve_start"]))
