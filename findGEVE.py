@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from itertools import product
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple, Any
 import numpy as np
 import pandas as pd
 import pyfastx
@@ -46,7 +46,7 @@ Optionals:
   -e, --evalue         E-value cutoff for HMM searches               [default: 1e-5]
   -m, --min-hallmark
                        Minimum number of hallmark copies
-                       required in the final retained GEVE           [default: 3]
+                       required in the final retained GEVE           [default: 2]
   -l, --min-geve-len   Minimum GEVE length                           [default: 50_000]
   --cluster-merge-gap  Maximum gap (bp) between same-contig clusters [default: 100_000]
   -h, --help           Show this help and exit
@@ -59,7 +59,7 @@ DEFAULTS = dict(
     min_contig          = 50_000,
     min_geve_length     = 50_000,
     min_hallmarks_seed  = 1,
-    min_hallmarks       = 3,
+    min_hallmarks       = 2,
     seed_window         = 300_000,
     cluster_merge_gap   = 100_000,
     max_cluster_span    = 2_000_000,
@@ -161,6 +161,47 @@ class Orf:
     virbit: float = 0.0
     pfambit: float = 0.0
     net_score: float = 0.0
+
+
+@dataclass
+class ContigOrfIndex:
+    orfs: List[Orf]
+    starts: np.ndarray
+    ends: np.ndarray
+    has_marker: np.ndarray
+    rolling_scores: np.ndarray
+
+def build_contig_orf_indexes(
+    orfs_by_contig: Dict[str, List[Orf]],
+    rolling_by_orf_per_contig: Optional[Dict[str, Dict[str, float]]] = None,
+) -> Dict[str, ContigOrfIndex]:
+    """Build reusable per-contig ORF arrays for binary-search based scans.
+    """
+    rolling_by_orf_per_contig = rolling_by_orf_per_contig or {}
+    indexes: Dict[str, ContigOrfIndex] = {}
+    for contig, orfs in orfs_by_contig.items():
+        if not orfs:
+            continue
+        if any(orfs[i].start > orfs[i + 1].start for i in range(len(orfs) - 1)):
+            orfs = sorted(orfs, key=lambda o: o.start)
+            orfs_by_contig[contig] = orfs
+        rolling = rolling_by_orf_per_contig.get(contig, {})
+        indexes[contig] = ContigOrfIndex(
+            orfs=orfs,
+            starts=np.fromiter((o.start for o in orfs), dtype=np.int64, count=len(orfs)),
+            ends=np.fromiter((o.end for o in orfs), dtype=np.int64, count=len(orfs)),
+            has_marker=np.fromiter(
+                ((o.hallmark is not None) or (o.gvog is not None) for o in orfs),
+                dtype=np.bool_,
+                count=len(orfs),
+            ),
+            rolling_scores=np.fromiter(
+                (rolling.get(o.orf_id, 0.0) for o in orfs),
+                dtype=np.float64,
+                count=len(orfs),
+            ),
+        )
+    return indexes
 
 @dataclass
 class TirPair:
@@ -427,44 +468,106 @@ def _gap_is_host_territory(
     contig_orfs: List[Orf],
     rolling: Dict[str, float],
     host_fraction: float = 0.7,
+    contig_index: Optional[ContigOrfIndex] = None,
 ) -> bool:
     """Gap is host territory when no hallmark/GVOG hits and a majority of gap ORFs
-    have negative rolling viral score (fraction > host_fraction)."""
-    gap_orfs = [o for o in contig_orfs
-                if o.start > prev_end and o.end < curr_start]
-    if not gap_orfs:
+    have negative rolling viral score (fraction > host_fraction).
+    """
+    if curr_start <= prev_end + 1:
         return False
-    if any(o.hallmark is not None or o.gvog is not None for o in gap_orfs):
+
+    if contig_index is None:
+        if not contig_orfs:
+            return False
+        contig_orfs = sorted(contig_orfs, key=lambda o: o.start)
+        starts = np.fromiter((o.start for o in contig_orfs), dtype=np.int64, count=len(contig_orfs))
+        ends = np.fromiter((o.end for o in contig_orfs), dtype=np.int64, count=len(contig_orfs))
+        has_marker = np.fromiter(
+            ((o.hallmark is not None) or (o.gvog is not None) for o in contig_orfs),
+            dtype=np.bool_,
+            count=len(contig_orfs),
+        )
+        rolling_scores = np.fromiter(
+            (rolling.get(o.orf_id, 0.0) for o in contig_orfs),
+            dtype=np.float64,
+            count=len(contig_orfs),
+        )
+    else:
+        starts = contig_index.starts
+        ends = contig_index.ends
+        has_marker = contig_index.has_marker
+        rolling_scores = contig_index.rolling_scores
+
+    if starts.size == 0:
         return False
-    n_neg = sum(1 for o in gap_orfs if rolling.get(o.orf_id, 0.0) < 0)
-    return (n_neg / len(gap_orfs)) > host_fraction
+
+    left = int(np.searchsorted(starts, prev_end, side="right"))
+    right = int(np.searchsorted(starts, curr_start, side="left"))
+    if right <= left:
+        return False
+
+    inside_mask = ends[left:right] < curr_start
+    if not bool(np.any(inside_mask)):
+        return False
+    if bool(np.any(has_marker[left:right][inside_mask])):
+        return False
+
+    scores = rolling_scores[left:right][inside_mask]
+    return (float(np.count_nonzero(scores < 0.0)) / float(scores.size)) > host_fraction
 
 def _seed_one_contig(
     args: Tuple[str, List[Orf], int, int]
 ) -> Tuple[str, List[dict]]:
+    """Seed one contig using a two-pointer hallmark window.
+    """
     contig, hallmark_orfs, window_size, min_hallmarks = args
     half = window_size // 2
     out: List[dict] = []
     if len(hallmark_orfs) < min_hallmarks:
         return contig, out
-    hallmark_orfs = sorted(hallmark_orfs, key=lambda x: x.start)
-    starts = np.array([o.start for o in hallmark_orfs])
-    ends   = np.array([o.end   for o in hallmark_orfs])
-    for anchor in hallmark_orfs:
-        mid = (anchor.start + anchor.end) // 2
-        wstart, wend = mid - half, mid + half
-        mask = (starts <= wend) & (ends >= wstart)
-        members = [hallmark_orfs[i] for i in np.nonzero(mask)[0]]
-        fams = {m.hallmark for m in members}
-        if len(fams) < min_hallmarks:
+
+    hallmark_orfs = sorted(hallmark_orfs, key=lambda x: ((x.start + x.end) // 2, x.start, x.end))
+    mids = np.fromiter(((o.start + o.end) // 2 for o in hallmark_orfs), dtype=np.int64, count=len(hallmark_orfs))
+
+    left = 0
+    right = 0
+    n = len(hallmark_orfs)
+    for anchor_idx, mid in enumerate(mids):
+        wstart = int(mid) - half
+        wend = int(mid) + half
+        while left < n and mids[left] < wstart:
+            left += 1
+        while right < n and mids[right] <= wend:
+            right += 1
+
+        # Total hallmark copies in the window, not distinct hallmark types.
+        if (right - left) < min_hallmarks:
             continue
-        out.append(dict(
-            contig=contig,
-            cluster_start=min(m.start for m in members),
-            cluster_end=max(m.end for m in members),
-            orf_ids=[m.orf_id for m in members],
-            hallmarks=sorted(fams),
-        ))
+
+        members = hallmark_orfs[left:right]
+        cluster_start = min(m.start for m in members)
+        cluster_end = max(m.end for m in members)
+        orf_ids = {m.orf_id for m in members}
+        hallmarks = {m.hallmark for m in members if m.hallmark is not None}
+
+        if out and cluster_start <= out[-1]["cluster_end"]:
+            prev = out[-1]
+            prev["cluster_end"] = max(prev["cluster_end"], cluster_end)
+            prev["cluster_start"] = min(prev["cluster_start"], cluster_start)
+            prev["_orf_id_set"].update(orf_ids)
+            prev["_hallmark_set"].update(hallmarks)
+        else:
+            out.append(dict(
+                contig=contig,
+                cluster_start=cluster_start,
+                cluster_end=cluster_end,
+                _orf_id_set=set(orf_ids),
+                _hallmark_set=set(hallmarks),
+            ))
+
+    for c in out:
+        c["orf_ids"] = sorted(c.pop("_orf_id_set"))
+        c["hallmarks"] = sorted(c.pop("_hallmark_set"))
     return contig, out
 
 def find_seed_clusters(
@@ -476,6 +579,7 @@ def find_seed_clusters(
     rolling_by_orf_per_contig: Optional[Dict[str, Dict[str, float]]] = None,
     host_fraction: float = 0.7,
     threads: int = 1,
+    contig_orf_indexes: Optional[Dict[str, ContigOrfIndex]] = None,
 ) -> List[dict]:
     """Identify candidate GEVE clusters by sliding window over hallmark ORFs.
     """
@@ -526,9 +630,10 @@ def find_seed_clusters(
             if 0 <= gap <= cluster_merge_gap and new_span <= max_cluster_span:
                 contig_orfs = orfs_by_contig.get(c["contig"], [])
                 rolling = rolling_by_orf_per_contig.get(c["contig"], {})
+                contig_index = (contig_orf_indexes or {}).get(c["contig"])
                 if not _gap_is_host_territory(
                         prev["cluster_end"], c["cluster_start"], contig_orfs, rolling,
-                        host_fraction):
+                        host_fraction, contig_index):
                     prev["cluster_end"] = c["cluster_end"]
                     prev["orf_ids"]   = sorted(set(prev["orf_ids"])   | set(c["orf_ids"]))
                     prev["hallmarks"] = sorted(set(prev["hallmarks"]) | set(c["hallmarks"]))
@@ -538,7 +643,7 @@ def find_seed_clusters(
 
     _LOG.info(
         f"Seeding: {len(merged)} candidate region(s) "
-        f"(>= {min_hallmarks} distinct hallmarks within {window_size:,} bp; "
+        f"(>= {min_hallmarks} hallmark copy/copies within {window_size:,} bp; "
         f"merged within {cluster_merge_gap:,} bp, max span {max_cluster_span:,} bp; "
         f"{n_refused} merge(s) refused as host territory)"
     )
@@ -554,7 +659,7 @@ def compute_rolling_scores(
     half = rolling_window // 2
     result: Dict[str, Dict[str, float]] = {}
     for contig in candidate_contigs:
-        orfs = sorted(orfs_by_contig.get(contig, []), key=lambda x: x.start)
+        orfs = orfs_by_contig.get(contig, [])
         if not orfs:
             continue
         scores = np.fromiter((o.net_score for o in orfs), dtype=np.float64, count=len(orfs))
@@ -960,6 +1065,7 @@ def extend_tirless_boundaries(
     cluster_end: int,
     rolling_by_orf: Dict[str, float],
     cfg: dict,
+    contig_index: Optional[ContigOrfIndex] = None,
 ) -> Tuple[int, int, dict]:
     """Walk the rolling viral score outward from a seed cluster to find GEVE boundaries."""
     threshold       = cfg.get("extend_threshold", -0.5)
@@ -976,22 +1082,39 @@ def extend_tirless_boundaries(
         stop_left="not_started", stop_right="not_started",
     )
 
-    sorted_orfs = sorted(contig_orfs, key=lambda x: x.start)
+    if contig_index is not None:
+        sorted_orfs = contig_index.orfs
+        starts = contig_index.starts
+        ends = contig_index.ends
+        rolling_scores = contig_index.rolling_scores
+    else:
+        sorted_orfs = contig_orfs if not any(
+            contig_orfs[i].start > contig_orfs[i + 1].start
+            for i in range(len(contig_orfs) - 1)
+        ) else sorted(contig_orfs, key=lambda x: x.start)
+        starts = np.fromiter((o.start for o in sorted_orfs), dtype=np.int64, count=len(sorted_orfs))
+        ends = np.fromiter((o.end for o in sorted_orfs), dtype=np.int64, count=len(sorted_orfs))
+        rolling_scores = np.fromiter(
+            (rolling_by_orf.get(o.orf_id, 0.0) for o in sorted_orfs),
+            dtype=np.float64,
+            count=len(sorted_orfs),
+        )
+
     if not sorted_orfs:
         return cluster_start, cluster_end, diag
 
-    left_idx: Optional[int] = None
-    right_idx: Optional[int] = None
-    for i, o in enumerate(sorted_orfs):
-        if o.start >= cluster_start and o.end <= cluster_end:
-            if left_idx is None:
-                left_idx = i
-            right_idx = i
-    if left_idx is None or right_idx is None:
+    left = int(np.searchsorted(starts, cluster_start, side="left"))
+    right = int(np.searchsorted(starts, cluster_end, side="right"))
+    if right <= left:
         return cluster_start, cluster_end, diag
+    inside_rel = np.flatnonzero(ends[left:right] <= cluster_end)
+    if inside_rel.size == 0:
+        return cluster_start, cluster_end, diag
+    left_idx = left + int(inside_rel[0])
+    right_idx = left + int(inside_rel[-1])
 
-    edge_left_score  = rolling_by_orf.get(sorted_orfs[left_idx].orf_id,  0.0)
-    edge_right_score = rolling_by_orf.get(sorted_orfs[right_idx].orf_id, 0.0)
+    edge_left_score  = float(rolling_scores[left_idx])
+    edge_right_score = float(rolling_scores[right_idx])
 
     new_start = cluster_start
     if edge_left_score <= start_threshold:
@@ -1008,7 +1131,7 @@ def extend_tirless_boundaries(
             if (cluster_end - o.start + 1) > max_span:
                 diag["stop_left"] = "max_cluster_span"
                 break
-            score = rolling_by_orf.get(o.orf_id, 0.0)
+            score = float(rolling_scores[i])
             if score > threshold:
                 new_start = o.start
                 drops = 0
@@ -1035,7 +1158,7 @@ def extend_tirless_boundaries(
             if (o.end - new_start + 1) > max_span:
                 diag["stop_right"] = "max_cluster_span"
                 break
-            score = rolling_by_orf.get(o.orf_id, 0.0)
+            score = float(rolling_scores[i])
             if score > threshold:
                 new_end = o.end
                 drops = 0
@@ -1057,6 +1180,7 @@ def prescan_and_merge_clusters(
     orfs_by_contig: Dict[str, List[Orf]],
     rolling_by_orf_per_contig: Dict[str, Dict[str, float]],
     cfg: dict,
+    contig_orf_indexes: Optional[Dict[str, ContigOrfIndex]] = None,
 ) -> List[dict]:
     """Run viral-score pre-scan on each seed cluster, then merge same-contig
     clusters whose extended boundaries overlap or are within cluster_merge_gap.
@@ -1074,6 +1198,7 @@ def prescan_and_merge_clusters(
         if extend:
             pre_s, pre_e, diag = extend_tirless_boundaries(
                 contig_orfs, cl["cluster_start"], cl["cluster_end"], rolling, cfg,
+                (contig_orf_indexes or {}).get(contig),
             )
             if diag.get("applied"):
                 _LOG.info(
@@ -1107,7 +1232,9 @@ def prescan_and_merge_clusters(
                         prev["pre_end"], c["pre_start"],
                         orfs_by_contig.get(c["contig"], []),
                         rolling_by_orf_per_contig.get(c["contig"], {}),
-                        host_fraction):
+                        host_fraction,
+                        (contig_orf_indexes or {}).get(c["contig"]),
+                    ):
                     prev["pre_end"]       = max(prev["pre_end"], c["pre_end"])
                     prev["cluster_start"] = min(prev["cluster_start"], c["cluster_start"])
                     prev["cluster_end"]   = max(prev["cluster_end"], c["cluster_end"])
@@ -2250,10 +2377,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     orfs_by_id, contig_lengths = predict_orfs(args.genome, cfg["min_contig"], args.threads)
     fa = pyfastx.Fasta(str(args.genome), build_index=True, uppercase=True)
 
-    # Build a contig -> ORF list once and reuse throughout
+    # Build sorted contig -> ORF lists once and reuse throughout.
     orfs_by_contig: Dict[str, List[Orf]] = {}
     for o in orfs_by_id.values():
         orfs_by_contig.setdefault(o.contig, []).append(o)
+    for contig in list(orfs_by_contig):
+        orfs_by_contig[contig].sort(key=lambda o: o.start)
 
     # Stage 2a: hallmark scan
     contig2hallmark_hits = scan_hallmarks(
@@ -2283,6 +2412,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     rolling_by_orf_per_contig = compute_rolling_scores(
         orfs_by_contig, cfg["rolling_window"], hallmark_contigs,
     )
+    contig_orf_indexes = build_contig_orf_indexes(orfs_by_contig, rolling_by_orf_per_contig)
 
     # Stage 3: seeding uses min_hallmarks_seed
     clusters = find_seed_clusters(
@@ -2294,6 +2424,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         rolling_by_orf_per_contig=rolling_by_orf_per_contig,
         host_fraction=cfg["host_territory_fraction"],
         threads=parallel,
+        contig_orf_indexes=contig_orf_indexes,
     )
     if not clusters:
         _LOG.warning("No clusters passed hallmark-density criterion. No GEVE candidates.")
@@ -2302,7 +2433,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Stage 3b: viral-score pre-scan + post-extension same-contig merge
     clusters = prescan_and_merge_clusters(
-        clusters, orfs_by_contig, rolling_by_orf_per_contig, cfg,
+        clusters, orfs_by_contig, rolling_by_orf_per_contig, cfg, contig_orf_indexes,
     )
 
     tasks = []
