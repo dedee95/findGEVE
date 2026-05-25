@@ -17,6 +17,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime
+from collections import Counter
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 import pandas as pd
@@ -542,9 +543,94 @@ def run_blastn_self(region_seq: str, cfg: dict, threads: int = 1) -> List[TirPai
 def _count_bracketed(tir: TirPair, intervals: List[Tuple[int, int]]) -> int:
     return sum(1 for s, e in intervals if tir.left_start <= s and e <= tir.right_end)
 
+def _dinucleotide_entropy(seq: str) -> float:
+    """Shannon entropy (bits) of overlapping ACGT dinucleotides."""
+    if len(seq) < 2:
+        return 0.0
+    counts: Counter = Counter()
+    seq = seq.upper()
+    for i in range(len(seq) - 1):
+        di = seq[i:i + 2]
+        if "N" in di:
+            continue
+        counts[di] += 1
+    total = sum(counts.values())
+    if total == 0:
+        return 0.0
+    entropy = 0.0
+    for c in counts.values():
+        p = c / total
+        entropy -= p * math.log2(p)
+    return entropy
+
+def _max_kmer_frac(seq: str, k: int) -> float:
+    """Maximum fraction of any single k-mer across all phase offsets."""
+    seq = seq.upper().encode("ascii", errors="ignore")
+    n = len(seq)
+    if n < k:
+        return 0.0
+    best = 0.0
+    for phase in range(k):
+        tiles = [seq[i:i + k] for i in range(phase, n - k + 1, k)]
+        valid = [t for t in tiles if b"N" not in t]
+        if not valid:
+            continue
+        counts = Counter(valid)
+        best = max(best, max(counts.values()) / len(valid))
+    return best
+
+def _max_tandem_period_fraction(seq: str, max_period: int) -> float:
+    """Maximum fraction of positions i where seq[i] == seq[i+p], p=1..max_period."""
+    seq = seq.upper()
+    n = len(seq)
+    if n < 2 or max_period < 1:
+        return 0.0
+    best = 0.0
+    for p in range(1, min(max_period, n - 1) + 1):
+        total = 0
+        matches = 0
+        for i in range(n - p):
+            a, b = seq[i], seq[i + p]
+            if a == "N" or b == "N":
+                continue
+            total += 1
+            if a == b:
+                matches += 1
+        if total:
+            best = max(best, matches / total)
+    return best
+
+def _tir_is_low_complexity(seq: str, min_entropy: float, max_kmer_frac: float,
+                           max_tandem_frac: float, max_tandem_period: int) -> Tuple[bool, str]:
+    if not seq:
+        return True, "empty TIR sequence"
+    entropy = _dinucleotide_entropy(seq)
+    if entropy < min_entropy:
+        return True, f"dinuc_entropy={entropy:.2f}<{min_entropy}"
+    for k in (1, 2, 3, 4):
+        frac = _max_kmer_frac(seq, k)
+        if frac > max_kmer_frac:
+            return True, f"{k}-mer_fraction={frac:.2f}>{max_kmer_frac}"
+    tandem_frac = _max_tandem_period_fraction(seq, max_tandem_period)
+    if tandem_frac > max_tandem_frac:
+        return True, f"tandem_fraction={tandem_frac:.2f}>{max_tandem_frac}"
+    return False, ""
+
+def _tir_brackets_reviewed_boundary(tir: TirPair, candidate_start: int, candidate_end: int, cfg: dict) -> bool:
+    """Review-mode safety check: accepted TIR must reasonably bracket reviewed interval."""
+    span = max(1, candidate_end - candidate_start + 1)
+    slop = max(int(cfg.get("tir_edge_slop", 50_000)), int(span * float(cfg.get("tir_bracket_slop_frac", 0.10))))
+    return tir.left_start <= candidate_start + slop and tir.right_end >= candidate_end - slop
+
 def select_best_tir(pairs: List[TirPair], region_offset: int, candidate_start: int,
-                    candidate_end: int, hallmark_intervals: List[Tuple[int, int]], cfg: dict) -> Optional[TirPair]:
+                    candidate_end: int, hallmark_intervals: List[Tuple[int, int]],
+                    cfg: dict, region_seq: Optional[str] = None) -> Optional[TirPair]:
     valid = []
+    min_entropy = cfg.get("tir_min_dinuc_entropy", 2.0)
+    max_kmer_frac = cfg.get("tir_max_kmer_fraction", 0.70)
+    max_tandem_frac = cfg.get("tir_max_tandem_fraction", 0.70)
+    max_tandem_period = cfg.get("tir_tandem_max_period", 12)
+    bracket_frac = cfg.get("tir_bracket_fraction", 1.0)
     for t in pairs:
         abs_t = TirPair(
             left_start=t.left_start + region_offset - 1,
@@ -566,13 +652,20 @@ def select_best_tir(pairs: List[TirPair], region_offset: int, candidate_start: i
             continue
         if not (cfg["tir_min_insert"] <= abs_t.insert_size <= cfg["tir_max_insert"]):
             continue
+        if region_seq is not None:
+            left_seq = region_seq[t.left_start - 1:t.left_end]
+            right_seq = region_seq[t.right_start - 1:t.right_end]
+            left_lc, _ = _tir_is_low_complexity(left_seq, min_entropy, max_kmer_frac, max_tandem_frac, max_tandem_period)
+            right_lc, _ = _tir_is_low_complexity(right_seq, min_entropy, max_kmer_frac, max_tandem_frac, max_tandem_period)
+            if left_lc or right_lc:
+                continue
+        if not _tir_brackets_reviewed_boundary(abs_t, candidate_start, candidate_end, cfg):
+            continue
         edge_distance = abs(abs_t.left_start - candidate_start) + abs(candidate_end - abs_t.right_end)
-        if edge_distance > cfg["tir_edge_slop"]:
-            continue
         bracketed = _count_bracketed(abs_t, hallmark_intervals)
-        if hallmark_intervals and bracketed < max(1, math.ceil(len(hallmark_intervals) * 0.5)):
+        if hallmark_intervals and bracketed < max(1, math.ceil(len(hallmark_intervals) * bracket_frac)):
             continue
-        valid.append((bracketed, -edge_distance, abs_t.tir_identity, abs_t.tir_length, abs_t.score, abs_t))
+        valid.append((bracketed, -edge_distance, abs_t.tir_identity, abs_t.insert_size, abs_t.tir_length, abs_t.score, abs_t))
     if not valid:
         return None
 
@@ -641,7 +734,7 @@ def redetect_tir_tsd(seqs: Dict[str, str], marker: pd.DataFrame, geve_name: str,
         messages.append(f"TIR detection skipped/failed: {exc}")
         return None, None, messages
     hms = hallmark_intervals(marker, geve_name, start, end)
-    tir = select_best_tir(raw_pairs, search_start, start, end, hms, cfg)
+    tir = select_best_tir(raw_pairs, search_start, start, end, hms, cfg, region_seq=region_seq)
     if tir is None:
         messages.append(f"no TIR passed filters among {len(raw_pairs)} raw inverted-repeat pairs")
         return None, None, messages
@@ -1008,6 +1101,12 @@ def apply_review(args) -> None:
         tir_min_insert=args.tir_min_insert,
         tir_max_insert=args.tir_max_insert,
         tir_edge_slop=args.tir_edge_slop,
+        tir_bracket_slop_frac=args.tir_bracket_slop_frac,
+        tir_bracket_fraction=args.tir_bracket_fraction,
+        tir_min_dinuc_entropy=args.tir_min_dinuc_entropy,
+        tir_max_kmer_fraction=args.tir_max_kmer_fraction,
+        tir_max_tandem_fraction=args.tir_max_tandem_fraction,
+        tir_tandem_max_period=args.tir_tandem_max_period,
         blastn_word_size=args.blastn_word_size,
         blastn_reward=args.blastn_reward,
         blastn_penalty=args.blastn_penalty,
@@ -1088,17 +1187,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_apply.add_argument("--overwrite", action="store_true", help="Allow writing into a non-empty output directory")
     p_apply.add_argument("--no-plot", action="store_true", help="Skip automatic plotting")
     p_apply.add_argument("-t", "--threads", type=int, default=1, help="blastn threads [default: 1]")
-    p_apply.add_argument("--tir-flank", type=int, default=50_000, help="TIR search flank around changed interval [default: 50000]")
-    p_apply.add_argument("--tir-min-len", type=int, default=20)
-    p_apply.add_argument("--tir-max-len", type=int, default=5000)
-    p_apply.add_argument("--tir-min-id", type=float, default=75.0)
-    p_apply.add_argument("--tir-min-insert", type=int, default=1000)
-    p_apply.add_argument("--tir-max-insert", type=int, default=2_000_000)
+    p_apply.add_argument("--tir-flank", type=int, default=50_000, help="TIR search flank around changed interval [default: 50_000]")
+    p_apply.add_argument("--tir-min-len", type=int, default=10)
+    p_apply.add_argument("--tir-max-len", type=int, default=10_000)
+    p_apply.add_argument("--tir-min-id", type=float, default=65.0)
+    p_apply.add_argument("--tir-min-insert", type=int, default=30_000)
+    p_apply.add_argument("--tir-max-insert", type=int, default=2_500_000)
     p_apply.add_argument("--tir-edge-slop", type=int, default=50_000)
+    p_apply.add_argument("--tir-bracket-slop-frac", type=float, default=0.10, help="Extra review-boundary bracket slop as interval fraction [default: 0.10]")
+    p_apply.add_argument("--tir-bracket-fraction", type=float, default=1.0, help="Fraction of hallmark intervals that must be bracketed by TIR [default: 1.0]")
+    p_apply.add_argument("--tir-min-dinuc-entropy", type=float, default=2.0, help="Minimum dinucleotide entropy for each TIR arm [default: 2.0]")
+    p_apply.add_argument("--tir-max-kmer-fraction", type=float, default=0.70, help="Maximum dominant k-mer fraction for each TIR arm [default: 0.70]")
+    p_apply.add_argument("--tir-max-tandem-fraction", type=float, default=0.70, help="Maximum tandem-period match fraction for each TIR arm [default: 0.70]")
+    p_apply.add_argument("--tir-tandem-max-period", type=int, default=12, help="Maximum tandem period tested during low-complexity filtering [default: 12]")
     p_apply.add_argument("--tsd-min-len", type=int, default=4)
     p_apply.add_argument("--tsd-max-len", type=int, default=12)
-    p_apply.add_argument("--tsd-max-slide", type=int, default=3)
-    p_apply.add_argument("--tsd-flank", type=int, default=100)
+    p_apply.add_argument("--tsd-max-slide", type=int, default=2)
+    p_apply.add_argument("--tsd-flank", type=int, default=60)
     p_apply.add_argument("--blastn-word-size", type=int, default=7)
     p_apply.add_argument("--blastn-reward", type=int, default=1)
     p_apply.add_argument("--blastn-penalty", type=int, default=-1)
