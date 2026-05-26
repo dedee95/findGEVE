@@ -7,6 +7,7 @@ Author: Dede Kurniawan (dedekurniawan@genomics.cn)
 from __future__ import annotations
 
 import argparse
+import gzip
 import logging
 import re
 import shutil
@@ -45,8 +46,8 @@ Optionals:
   -e, --evalue         E-value cutoff for HMM searches               [default: 1e-5]
   -m, --min-hallmark
                        Minimum number of hallmark copies
-                       required in the final retained GEVE           [default: 3]
-  -l, --min-geve-len   Minimum GEVE length                           [default: 50_000]
+                       required in the final retained GEVE           [default: 2]
+  -l, --min-geve-len   Minimum GEVE length                           [default: 30_000]
   --cluster-merge-gap  Maximum gap (bp) between same-contig clusters [default: 150_000]
   -h, --help           Show this help and exit
 """
@@ -55,10 +56,10 @@ USAGE_TEXT = "Usage: findGEVE.py -db <DB directory> --prefix <prefix> <genome.fa
 
 # tunable parameters.
 DEFAULTS = dict(
-    min_contig          = 50_000,
-    min_geve_length     = 50_000,
+    min_contig          = 30_000,
+    min_geve_length     = 30_000,
     min_hallmarks_seed  = 1,
-    min_hallmarks       = 3,
+    min_hallmarks       = 2,
     seed_window         = 300_000,
     cluster_merge_gap   = 150_000,
     max_cluster_span    = 2_000_000,
@@ -85,6 +86,30 @@ _NATKEY_RE = re.compile(r"(\d+)")
 
 def _natural_key(s: str):
     return [int(t) if t.isdigit() else t.lower() for t in _NATKEY_RE.split(str(s))]
+
+def _fetch_seq(fa: pyfastx.Fasta, genome_path: str, contig: str, start: int, end: int) -> str:
+    try:
+        return fa.fetch(contig, (start, end))
+    except UnicodeDecodeError:
+        opener = gzip.open if str(genome_path).endswith(".gz") else open
+        target = contig.encode()
+        seq = bytearray()
+        in_target = False
+        with opener(genome_path, "rb") as fh:
+            for raw in fh:
+                if raw.startswith(b">"):
+                    name = raw[1:].strip().split(None, 1)[0]
+                    if in_target:
+                        break
+                    in_target = name == target
+                    continue
+                if in_target:
+                    seq.extend(raw.strip())
+                    if len(seq) >= end:
+                        break
+        if not seq:
+            raise
+        return bytes(seq[start - 1:end]).decode("ascii", "replace").upper()
 
 _LOG = logging.getLogger("findGEVE")
 
@@ -1267,7 +1292,7 @@ def extend_tirless_boundaries(
     """Walk the rolling viral score outward from a seed cluster to find GEVE boundaries."""
     threshold       = 0.0
     start_threshold = 0.0
-    max_bp    = 100_000
+    max_bp    = 500_000
     max_drops = 5
     max_span  = cfg["max_cluster_span"]
 
@@ -1479,14 +1504,14 @@ def _process_cluster(task: dict) -> dict:
     flanks_tried: List[int] = []
 
     flank_start = 100_000
-    flank_max   = 100_000
+    flank_max   = 200_000
     step        = 100_000
 
     with tempfile.TemporaryDirectory(prefix="findGEVE_") as tmp:
         tmp = Path(tmp)
         rstart_max = max(1, pre_start - flank_max)
         rend_max   = min(clen, pre_end + flank_max)
-        region_seq_max = fa.fetch(contig, (rstart_max, rend_max))
+        region_seq_max = _fetch_seq(fa, genome_path, contig, rstart_max, rend_max)
 
         region_fa = tmp / f"cluster_{ci:04d}.fa"
         tab_out   = tmp / f"cluster_{ci:04d}.tsv"
@@ -1605,12 +1630,12 @@ def _process_cluster(task: dict) -> dict:
         l_flank_start = max(1, l_flank_end - win)
         r_flank_start = tir_for_output.right_end + 1
         r_flank_end   = min(clen, r_flank_start + win)
-        left_flank  = fa.fetch(contig, (l_flank_start, l_flank_end)) if l_flank_end >= l_flank_start else ""
-        right_flank = fa.fetch(contig, (r_flank_start, r_flank_end)) if r_flank_end >= r_flank_start else ""
+        left_flank  = _fetch_seq(fa, genome_path, contig, l_flank_start, l_flank_end) if l_flank_end >= l_flank_start else ""
+        right_flank = _fetch_seq(fa, genome_path, contig, r_flank_start, r_flank_end) if r_flank_end >= r_flank_start else ""
         tsd = find_tsd(left_flank, right_flank, 4, 12, 2)
 
     # GC content of the GEVE
-    geve_seq = fa.fetch(contig, (geve_start, geve_end))
+    geve_seq = _fetch_seq(fa, genome_path, contig, geve_start, geve_end)
     n_fraction = geve_seq.upper().count("N") / len(geve_seq) if geve_seq else 0.0
     n_max = 0.05
     if n_fraction > n_max:
@@ -1688,7 +1713,7 @@ def _build_tirless_merge(
         tir=None, tsd=None, orfs=geve_orfs,
         n_hallmarks=len(hms),
         hallmarks_present=sorted(set(hms)),
-        gc_geve=gc_of_seq(fa.fetch(contig, (new_start, new_end))),
+        gc_geve=gc_of_seq(_fetch_seq(fa, genome_path, contig, new_start, new_end)),
         has_tir=False, flank_used=0,
         boundary_method="viral_score_boundary",
     )
@@ -1876,7 +1901,7 @@ def _resolve_overlapping_geves(
                 hms = [o.hallmark for o in cur["orfs"] if o.hallmark]
                 cur["n_hallmarks"]       = len(hms)
                 cur["hallmarks_present"] = sorted(set(hms))
-                cur["gc_geve"] = gc_of_seq(fa.fetch(contig, (new_start, new_end)))
+                cur["gc_geve"] = gc_of_seq(_fetch_seq(fa, genome_path, contig, new_start, new_end))
                 merged_count += 1
                 continue
             if merged_count > 1:
