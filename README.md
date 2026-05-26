@@ -117,11 +117,11 @@ Optionals:
   -t, --threads        CPU threads for ORF prediction and HMM search [default: 4]
   -p, --parallel       Parallel seed-clustering and TIR workers      [default: --threads]
   -e, --evalue         E-value cutoff for HMM searches               [default: 1e-5]
-  -m, --min-hallmark-type
-                       Minimum number of distinct hallmark types
+  -m, --min-hallmark
+                       Minimum number of hallmark copies
                        required in the final retained GEVE           [default: 2]
-  -l, --min-geve-len   Minimum GEVE length                           [default: 50_000]
-  --cluster-merge-gap  Maximum gap (bp) between same-contig clusters [default: 100_000]
+  -l, --min-geve-len   Minimum GEVE length                           [default: 30_000]
+  --cluster-merge-gap  Maximum gap (bp) between same-contig clusters [default: 150_000]
   -h, --help           Show this help and exit
 ```
 
