@@ -1290,9 +1290,9 @@ def extend_tirless_boundaries(
     contig_index: Optional[ContigOrfIndex] = None,
 ) -> Tuple[int, int, dict]:
     """Walk the rolling viral score outward from a seed cluster to find GEVE boundaries."""
-    threshold       = 0.0
+    threshold       = -0.5
     start_threshold = 0.0
-    max_bp    = 500_000
+    max_bp    = 200_000
     max_drops = 5
     max_span  = cfg["max_cluster_span"]
 
