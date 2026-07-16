@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+from urllib.parse import unquote
 import numpy as np
 import pandas as pd
 import pyfastx
@@ -43,9 +44,11 @@ Optionals:
   -o, --outdir         Output directory                              [default: ./Result_<YYYYMMDD>]
   -t, --threads        CPU threads for ORF prediction and HMM search [default: 4]
   -p, --parallel       Parallel seed-clustering and TIR workers      [default: --threads]
+  -g, --gff            Host eukaryotic gene annotation in GFF/GFF3;
+                       Pyrodigal-GV ORFs fully contained in host
+                       gene/transcript/CDS/exon spans are removed
   -e, --evalue         E-value cutoff for HMM searches               [default: 1e-5]
-  -m, --min-hallmark
-                       Minimum number of hallmark copies
+  -m, --min-hallmark   Minimum number of hallmark copies
                        required in the final retained GEVE           [default: 2]
   -l, --min-geve-len   Minimum GEVE length                           [default: 30_000]
   --cluster-merge-gap  Maximum gap (bp) between same-contig clusters [default: 150_000]
@@ -81,6 +84,26 @@ DEFAULTS = dict(
 
 _HOST_TERRITORY_FRACTION = 0.7
 _GEVE_MERGE_GAP          = 150_000
+
+# Canonical NCLDV hallmark short names. These names are used exactly as
+# the HMM profile names and are preserved in hallmark output filenames.
+_HALLMARK_ORDER = [
+    "A32", "D5", "SFII", "MCP", "mRNAc",
+    "PolB", "RNAPL", "RNAPS", "RNR", "VLTF3",
+]
+_HALLMARK_CANONICAL = {name.lower(): name for name in _HALLMARK_ORDER}
+
+def _canonical_hallmark_name(name: str) -> str:
+    """Return the preferred short hallmark name, preserving unknown HMM names."""
+    return _HALLMARK_CANONICAL.get(str(name).lower(), str(name))
+
+def _hallmark_sort_key(name: str):
+    canonical = _canonical_hallmark_name(name)
+    try:
+        return (0, _HALLMARK_ORDER.index(canonical))
+    except ValueError:
+        return (1, _natural_key(canonical))
+
 
 _NATKEY_RE = re.compile(r"(\d+)")
 
@@ -302,6 +325,210 @@ def predict_orfs(
         sys.exit(1)
     return orfs_by_id, contig_lens
 
+# Optional host eukaryotic GFF/GFF3 mask for Pyrodigal-GV false positives
+_GFF_GENE_LIKE_FEATURES = {
+    "gene",
+    "mrna", "transcript", "primary_transcript",
+    "lncrna", "ncrna", "rrna", "trna", "snorna", "snrna", "mirna",
+    "pseudogene", "pseudogenic_transcript",
+}
+_GFF_PART_FEATURES = {"cds", "exon"}
+_GFF_IGNORED_FEATURES = {
+    "intron", "start_codon", "stop_codon", "five_prime_utr", "three_prime_utr",
+    "5utr", "3utr", "five_prime_utr", "three_prime_utr", "utr",
+}
+
+
+def _parse_gff_attributes(attr_text: str) -> Dict[str, str]:
+    """Parse GFF3/GTF-like attribute text defensively.
+
+    Supports common GFF3 forms such as ID=x;Parent=y and simple GTF-like
+    forms such as gene_id "x"; transcript_id "y". Values are URL-decoded.
+    """
+    attrs: Dict[str, str] = {}
+    attr_text = attr_text.strip()
+    if not attr_text or attr_text == ".":
+        return attrs
+
+    for raw_part in attr_text.split(";"):
+        part = raw_part.strip()
+        if not part:
+            continue
+        if "=" in part:
+            key, val = part.split("=", 1)
+        elif " " in part:
+            key, val = part.split(None, 1)
+            val = val.strip().strip('"')
+        else:
+            continue
+        key = key.strip()
+        val = unquote(val.strip().strip('"'))
+        if key:
+            attrs[key] = val
+    return attrs
+
+
+def _merge_intervals(intervals: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    if not intervals:
+        return []
+    intervals = sorted((min(s, e), max(s, e)) for s, e in intervals)
+    merged: List[Tuple[int, int]] = []
+    for s, e in intervals:
+        if merged and s <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
+def parse_host_gff_intervals(gff_path: Path) -> Dict[str, List[Tuple[int, int]]]:
+    """Return host annotation intervals by contig from a eukaryotic GFF/GFF3.
+
+    The parser intentionally accepts heterogeneous annotations:
+      * gene/mRNA/transcript-like rows are used directly as genic spans;
+      * CDS/exon rows are used directly, and their Parent/ID groups are also
+        collapsed into transcript/gene spans, which helps when a GFF lacks
+        explicit gene or mRNA rows;
+      * intron/codon/UTR rows are ignored as independent evidence.
+
+    Coordinates are kept as 1-based inclusive, matching Pyrodigal-GV gene.begin
+    and gene.end values used elsewhere in this script.
+    """
+    intervals_by_contig: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
+    parts_by_parent: Dict[Tuple[str, str], List[Tuple[int, int]]] = defaultdict(list)
+    n_rows = n_used = n_gene_like = n_part = 0
+
+    opener = gzip.open if str(gff_path).endswith(".gz") else open
+    with opener(gff_path, "rt", encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            cols = line.split("\t")
+            if len(cols) < 5:
+                continue
+            n_rows += 1
+            contig = cols[0]
+            feature = cols[2].strip().lower() if len(cols) > 2 else ""
+            try:
+                start = int(cols[3])
+                end = int(cols[4])
+            except (TypeError, ValueError):
+                continue
+            if start <= 0 or end <= 0:
+                continue
+            start, end = min(start, end), max(start, end)
+
+            if feature in _GFF_IGNORED_FEATURES:
+                continue
+
+            attrs = _parse_gff_attributes(cols[8] if len(cols) >= 9 else "")
+
+            if feature in _GFF_GENE_LIKE_FEATURES:
+                intervals_by_contig[contig].append((start, end))
+                n_used += 1
+                n_gene_like += 1
+                continue
+
+            if feature in _GFF_PART_FEATURES:
+                intervals_by_contig[contig].append((start, end))
+                n_used += 1
+                n_part += 1
+
+                parent_text = attrs.get("Parent") or attrs.get("parent")
+                if parent_text:
+                    parents = [p.strip() for p in parent_text.split(",") if p.strip()]
+                else:
+                    fallback = (
+                        attrs.get("transcript_id") or attrs.get("gene_id")
+                        or attrs.get("ID") or attrs.get("Name")
+                    )
+                    parents = [fallback] if fallback else []
+                for parent in parents:
+                    parts_by_parent[(contig, parent)].append((start, end))
+                continue
+
+            # Conservative fallback for non-standard eukaryotic annotations:
+            # if the feature name itself contains gene/transcript/exon/CDS terms,
+            # use it rather than silently losing the mask.
+            if any(tok in feature for tok in ("gene", "transcript", "mrna")):
+                intervals_by_contig[contig].append((start, end))
+                n_used += 1
+                n_gene_like += 1
+            elif any(tok == feature or tok in feature for tok in ("cds", "exon")):
+                intervals_by_contig[contig].append((start, end))
+                n_used += 1
+                n_part += 1
+
+    for (contig, _parent), parts in parts_by_parent.items():
+        if parts:
+            intervals_by_contig[contig].append((min(s for s, _ in parts), max(e for _, e in parts)))
+
+    merged_by_contig = {
+        contig: _merge_intervals(intervals)
+        for contig, intervals in intervals_by_contig.items()
+        if intervals
+    }
+    n_intervals = sum(len(v) for v in merged_by_contig.values())
+    _LOG.info(
+        f"Host GFF mask: parsed {n_rows:,} feature row(s) from {gff_path}; "
+        f"used {n_used:,} row(s) ({n_gene_like:,} gene/transcript-like, "
+        f"{n_part:,} CDS/exon); collapsed to {n_intervals:,} interval(s) "
+        f"on {len(merged_by_contig):,} contig(s)"
+    )
+    if n_intervals == 0:
+        _LOG.warning(
+            f"Host GFF mask: no usable gene/mRNA/transcript/CDS/exon intervals "
+            f"were parsed from {gff_path}; no ORFs will be removed by --gff"
+        )
+    return merged_by_contig
+
+
+def _is_fully_contained_in_intervals(
+    contig_intervals: List[Tuple[int, int]],
+    start: int,
+    end: int,
+) -> bool:
+    """True if [start, end] is fully contained in any merged host interval."""
+    if not contig_intervals:
+        return False
+    # Intervals are merged and sorted. The containing interval, if present,
+    # must be the rightmost interval with start <= ORF start.
+    lo, hi = 0, len(contig_intervals)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if contig_intervals[mid][0] <= start:
+            lo = mid + 1
+        else:
+            hi = mid
+    idx = lo - 1
+    return idx >= 0 and contig_intervals[idx][0] <= start and contig_intervals[idx][1] >= end
+
+
+def filter_orfs_by_host_gff(
+    orfs_by_id: Dict[str, Orf],
+    host_intervals_by_contig: Dict[str, List[Tuple[int, int]]],
+) -> int:
+    """Remove Pyrodigal-GV ORFs fully contained in host eukaryotic annotations."""
+    if not host_intervals_by_contig or not orfs_by_id:
+        return 0
+    remove_ids: List[str] = []
+    for orf_id, orf in orfs_by_id.items():
+        if _is_fully_contained_in_intervals(
+            host_intervals_by_contig.get(orf.contig, []), orf.start, orf.end
+        ):
+            remove_ids.append(orf_id)
+    for orf_id in remove_ids:
+        del orfs_by_id[orf_id]
+    _LOG.info(
+        f"Host GFF mask: removed {len(remove_ids):,} Pyrodigal-GV ORF(s) "
+        f"fully contained in host annotation intervals; "
+        f"{len(orfs_by_id):,} ORF(s) retained for HMM scans"
+    )
+    if not orfs_by_id:
+        _LOG.warning("Host GFF mask removed all predicted ORFs.")
+    return len(remove_ids)
+
 # Stage 2: HMM scans
 _HMMER_MAX_TARGET_LEN = 100_000
 
@@ -356,7 +583,7 @@ def scan_hallmarks(
     contig2hits: Dict[str, List[str]] = defaultdict(list)
     n_hits = 0
     for top_hits in pyhmmer.hmmsearch(hmms, seqs, cpus=threads, E=evalue):
-        hmm_name = _hmm_query_name(top_hits)
+        hmm_name = _canonical_hallmark_name(_hmm_query_name(top_hits))
         cutoff = score_cutoffs.get(hmm_name, 0.0)
         for hit in top_hits:
             if not hit.included:
@@ -563,7 +790,7 @@ def _seed_one_contig(
 
     for c in out:
         c["orf_ids"] = sorted(c.pop("_orf_id_set"))
-        c["hallmarks"] = sorted(c.pop("_hallmark_set"))
+        c["hallmarks"] = sorted(c.pop("_hallmark_set"), key=_hallmark_sort_key)
     return contig, out
 
 def find_seed_clusters(
@@ -612,7 +839,7 @@ def find_seed_clusters(
             prev = overlap_merged[-1]
             prev["cluster_end"] = max(prev["cluster_end"], c["cluster_end"])
             prev["orf_ids"]   = sorted(set(prev["orf_ids"])   | set(c["orf_ids"]))
-            prev["hallmarks"] = sorted(set(prev["hallmarks"]) | set(c["hallmarks"]))
+            prev["hallmarks"] = sorted(set(prev["hallmarks"]) | set(c["hallmarks"]), key=_hallmark_sort_key)
         else:
             overlap_merged.append(dict(c))
 
@@ -632,7 +859,7 @@ def find_seed_clusters(
                         host_fraction, contig_index):
                     prev["cluster_end"] = c["cluster_end"]
                     prev["orf_ids"]   = sorted(set(prev["orf_ids"])   | set(c["orf_ids"]))
-                    prev["hallmarks"] = sorted(set(prev["hallmarks"]) | set(c["hallmarks"]))
+                    prev["hallmarks"] = sorted(set(prev["hallmarks"]) | set(c["hallmarks"]), key=_hallmark_sort_key)
                     continue
                 n_refused += 1
         merged.append(dict(c))
@@ -1457,7 +1684,7 @@ def prescan_and_merge_clusters(
                     prev["cluster_start"] = min(prev["cluster_start"], c["cluster_start"])
                     prev["cluster_end"]   = max(prev["cluster_end"], c["cluster_end"])
                     prev["orf_ids"]   = sorted(set(prev["orf_ids"])   | set(c["orf_ids"]))
-                    prev["hallmarks"] = sorted(set(prev["hallmarks"]) | set(c["hallmarks"]))
+                    prev["hallmarks"] = sorted(set(prev["hallmarks"]) | set(c["hallmarks"]), key=_hallmark_sort_key)
                     prev["prescan_diag"] = dict(prev.get("prescan_diag") or {})
                     prev["prescan_diag"]["applied"] = True
                     n_merged += 1
@@ -1611,7 +1838,7 @@ def _process_cluster(task: dict) -> dict:
                  if o.start >= geve_start and o.end <= geve_end]
     geve_orfs.sort(key=lambda x: x.start)
     geve_hallmarks = [o.hallmark for o in geve_orfs if o.hallmark]
-    hallmark_types = sorted(set(geve_hallmarks))
+    hallmark_types = sorted(set(geve_hallmarks), key=_hallmark_sort_key)
     if not hallmark_types:
         return dict(
             status="skip", cluster_index=ci, contig=contig, log_msgs=log_msgs,
@@ -1712,7 +1939,7 @@ def _build_tirless_merge(
         geve_length=new_end - new_start + 1,
         tir=None, tsd=None, orfs=geve_orfs,
         n_hallmarks=len(hms),
-        hallmarks_present=sorted(set(hms)),
+        hallmarks_present=sorted(set(hms), key=_hallmark_sort_key),
         gc_geve=gc_of_seq(_fetch_seq(fa, genome_path, contig, new_start, new_end)),
         has_tir=False, flank_used=0,
         boundary_method="viral_score_boundary",
@@ -1900,7 +2127,7 @@ def _resolve_overlapping_geves(
                 )
                 hms = [o.hallmark for o in cur["orfs"] if o.hallmark]
                 cur["n_hallmarks"]       = len(hms)
-                cur["hallmarks_present"] = sorted(set(hms))
+                cur["hallmarks_present"] = sorted(set(hms), key=_hallmark_sort_key)
                 cur["gc_geve"] = gc_of_seq(_fetch_seq(fa, genome_path, contig, new_start, new_end))
                 merged_count += 1
                 continue
@@ -2313,16 +2540,21 @@ def write_hallmark_peps(geves: List[dict], outdir: Path, prefix: str) -> List[Pa
         for o in g["orfs"]:
             if not o.hallmark:
                 continue
-            current = by_hallmark[o.hallmark].get(geve_id)
+            hallmark = _canonical_hallmark_name(o.hallmark)
+            o.hallmark = hallmark
+            current = by_hallmark[hallmark].get(geve_id)
+            # For each GEVE and hallmark type, keep only the longest copy.
+            # This avoids duplicate copies of the same hallmark in the hallmark/*.pep outputs.
             if current is None or len(o.protein) > len(current.protein):
-                by_hallmark[o.hallmark][geve_id] = o
+                by_hallmark[hallmark][geve_id] = o
 
     hallmark_dir = outdir / "hallmark"
     hallmark_dir.mkdir(parents=True, exist_ok=True)
 
     written: List[Path] = []
-    for hallmark, geve_map in by_hallmark.items():
-        out_path = hallmark_dir / f"{prefix}.{hallmark.lower()}.pep"
+    for hallmark in sorted(by_hallmark, key=_hallmark_sort_key):
+        geve_map = by_hallmark[hallmark]
+        out_path = hallmark_dir / f"{prefix}.{hallmark}.pep"
         items = sorted(geve_map.items(), key=lambda kv: _natural_key(kv[0]))
         with open(out_path, "w") as fh:
             for geve_id, o in items:
@@ -2450,6 +2682,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    default=Path(f"Result_{datetime.now().strftime('%Y%m%d')}"))
     p.add_argument("-t", "--threads", type=int, default=4)
     p.add_argument("-p", "--parallel", type=int, default=None)
+    p.add_argument("-g", "--gff", type=Path, default=None,
+                   help="Optional host eukaryotic gene annotation GFF/GFF3 used to remove fully overlapping Pyrodigal-GV ORFs")
     p.add_argument("-e", "--evalue", type=float, default=DEFAULTS["evalue"])
     p.add_argument("-m", "--min-hallmark", dest="min_hallmark", type=int,
                    default=DEFAULTS["min_hallmarks"])
@@ -2528,6 +2762,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         f"blastn_threads={blastn_threads} | "
         f"genome={args.genome}"
     )
+    if args.gff is not None:
+        _LOG.info(f"Host GFF mask enabled: {args.gff}")
     _LOG.info(
         f"Parameters | min_contig={cfg['min_contig']:,} bp | "
         f"min_geve_length={cfg['min_geve_length']:,} bp | "
@@ -2541,6 +2777,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if not args.genome.exists():
         _LOG.error(f"Genome file not found: {args.genome}")
+        return 2
+    if args.gff is not None and not args.gff.exists():
+        _LOG.error(f"GFF annotation file not found: {args.gff}")
         return 2
 
     db = args.db
@@ -2570,6 +2809,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Stage 1: ORF prediction
     orfs_by_id, contig_lens = predict_orfs(args.genome, cfg["min_contig"], args.threads)
+    if args.gff is not None:
+        host_intervals_by_contig = parse_host_gff_intervals(args.gff)
+        filter_orfs_by_host_gff(orfs_by_id, host_intervals_by_contig)
+        if not orfs_by_id:
+            _LOG.error("No ORFs remain after applying the host GFF mask.")
+            return 2
     fa = pyfastx.Fasta(str(args.genome), build_index=True, uppercase=True)
 
     orfs_by_contig: Dict[str, List[Orf]] = {}
