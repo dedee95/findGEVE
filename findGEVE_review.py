@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-findGEVE_review.py - Apply manual review decisions to findGEVE outputs.
+findGEVE_review - Review findGEVE calls and annotate manually specified candidate regions.
 Author: Dede Kurniawan (dedekurniawan@genomics.cn)
 """
 
@@ -33,21 +33,105 @@ except ImportError as exc:
     ) from exc
 
 HELP_TEXT = """\
-findGEVE_review.py - Manual review helper for findGEVE results.
+{prog} - Review findGEVE results or annotate manually selected regions.
+
+Usage: {prog} <command> [OPTIONS]
+
+Commands:
+  make-template   Create a review.xlsx workbook from findGEVE summary output
+  apply           Apply review decisions and reannotate changed GEVE regions
+  region          Annotate one or more exact manually selected candidate regions
+
+Run {prog} <command> --help for command-specific options.
+"""
+
+MAKE_TEMPLATE_HELP_TEXT = """\
+{prog} make-template - Create a review workbook.
+
+Usage: {prog} make-template <prefix.summary.tsv> [OPTIONS]
+
+Mandatory:
+  summary              Input findGEVE <prefix>.summary.tsv
+
+Optionals:
+  --overwrite          Replace an existing <prefix>.review.xlsx
+  -h, --help           Show this help and exit
+"""
+
+APPLY_HELP_TEXT = """\
+{prog} apply - Apply manual review decisions to findGEVE results.
 
 Usage:
-  findGEVE_review.py make-template <prefix.summary.tsv>
-  findGEVE_review.py apply \
-    --review <prefix.review.xlsx> \
-    --summary <prefix.summary.tsv> \
-    --markerout <prefix.markerout> \
-    --bed <prefix.geve.bed> \
-    --genome genome.fa [OPTIONS]
+  {prog} apply \\
+    -db <directory> \\
+    --genome genome.fa \\
+    --review <prefix.review.xlsx> \\
+    --summary <prefix.summary.tsv> \\
+    --markerout <prefix.markerout> [OPTIONS]
+
+Mandatory:
+  -db, --db            HMM database directory containing NCLDV_markers.hmm
+                       and gvog.complete.hmm; Pfam-A.hmm is optional
+  --genome             Input genome assembly FASTA; gzip is acceptable
+  --review             Reviewed <prefix>.review.xlsx workbook
+  --summary            Original findGEVE <prefix>.summary.tsv
+  --markerout          Original findGEVE <prefix>.markerout
+
+Optionals:
+  -g, --gff            Host eukaryotic annotation in GFF/GFF3 format
+  --prefix             Output prefix inferred from --summary when omitted
+  -o, --outdir         Output directory
+  --outbase            Base directory for an automatic Review_<YYYYMMDD> folder
+  -t, --threads        CPU threads for ORF prediction and HMM search [default: 4]
+  -e, --evalue         E-value cutoff for HMM searches              [default: 1e-5]
+  --overwrite          Allow writing into a non-empty output directory
+  --no-plot            Skip automatic plotting
+  -h, --help           Show this help and exit
 
 Review actions:
-  unchanged   Keep the original GEVE call.
-  remove      Remove the GEVE from reviewed outputs.
-  change      Use review_start/review_end as curated boundaries. If one side is blank, the original coordinate is kept.
+  unchanged            Keep the original GEVE call and annotation
+  remove               Remove the GEVE from reviewed outputs
+  change               Use exact reviewed coordinates and reannotate the full region
+"""
+
+REGION_HELP_TEXT = """\
+{prog} region - Annotate exact manually selected candidate regions.
+
+Usage:
+  {prog} region \\
+    -db <directory> --genome genome.fa --prefix <prefix> \\
+    --ctg <contig[,contig...]> \\
+    --start <start[,start...]> --end <end[,end...]> [OPTIONS]
+
+Mandatory:
+  -db, --db            HMM database directory containing NCLDV_markers.hmm
+                       and gvog.complete.hmm; Pfam-A.hmm is optional
+  --genome             Input genome assembly FASTA; gzip is acceptable
+  --prefix             Output prefix and GEVE ID prefix
+  --ctg                One or more contigs separated by commas
+  --start              Matching 1-based inclusive starts separated by commas
+  --end                Matching 1-based inclusive ends separated by commas
+
+Optionals:
+  -g, --gff            Host eukaryotic annotation in GFF/GFF3 format
+  -o, --outdir         Output directory
+  --outbase            Base directory for an automatic Result_<YYYYMMDD> folder
+  -t, --threads        CPU threads for ORF prediction and HMM search [default: 4]
+  -e, --evalue         E-value cutoff for HMM searches              [default: 1e-5]
+  --overwrite          Allow writing into a non-empty output directory
+  --no-plot            Skip automatic plotting
+  -h, --help           Show this help and exit
+
+Examples:
+  {prog} region -db DB --genome genome.fa --prefix sample \\
+    --ctg ctg1 --start 1 --end 10000
+
+  {prog} region -db DB --genome genome.fa --prefix sample \\
+    --ctg ctg1,ctg2 --start 1,500 --end 10000,20000
+
+The three lists must contain the same number of values. Candidate IDs follow
+input order: <prefix>_GEVE_001, <prefix>_GEVE_002, and so on. Every exact
+interval is retained even when no hallmark gene is detected.
 """
 
 _LOG = logging.getLogger("findGEVE_review")
@@ -1032,7 +1116,7 @@ def write_reviewed_bed(records: List[dict], bed: pd.DataFrame, path: Path) -> No
 
 def run_geve_plot(marker_path: Path, bed_path: Path, outdir: Path) -> None:
     candidates = [
-        Path(__file__).resolve().parent / "findGEVE_plot_v4.py",
+        Path(__file__).resolve().parent / "findGEVE_plot_v5.py",
         Path(__file__).resolve().parent / "findGEVE_plot.py",
     ]
     script = next((p for p in candidates if p.is_file()), None)
@@ -1058,173 +1142,660 @@ def run_geve_plot(marker_path: Path, bed_path: Path, outdir: Path) -> None:
     if proc.returncode != 0:
         _LOG.warning(f"findGEVE_plot.py exited with code {proc.returncode}; no plot produced")
 
+from collections import defaultdict
+from urllib.parse import unquote
+import numpy as np
+import pyhmmer
+import pyrodigal_gv
+
+_HALLMARK_ORDER = ["A32", "D5", "SFII", "MCP", "mRNAc", "PolB", "RNAPL", "RNAPS", "RNR", "VLTF3"]
+_HALLMARK_CANONICAL = {x.lower(): x for x in _HALLMARK_ORDER}
+_HALLMARK_SCORE_CUTOFFS = {"A32":100.0,"D5":180.0,"SFII":120.0,"MCP":120.0,"mRNAc":180.0,"PolB":300.0,"RNAPL":300.0,"RNAPS":250.0,"RNR":200.0,"VLTF3":100.0}
+
+@dataclass
+class ReviewOrf:
+    orf_id: str
+    contig: str
+    start: int
+    end: int
+    strand: int
+    protein: str
+    hallmark: Optional[str] = None
+    hallmark_bitscore: float = 0.0
+    hallmark_evalue: float = float("inf")
+    gvog: Optional[str] = None
+    gvog_bitscore: float = 0.0
+    gvog_evalue: float = float("inf")
+    best_pfam_acc: Optional[str] = None
+    best_pfam_name: Optional[str] = None
+    best_pfam_bitscore: float = 0.0
+    best_pfam_evalue: float = float("inf")
+    virbit: float = 0.0
+    pfambit: float = 0.0
+    net_score: float = 0.0
+
+def _canon_hallmark(name: str) -> str:
+    return _HALLMARK_CANONICAL.get(str(name).lower(), str(name))
+
+def _hallmark_key(name: str):
+    c = _canon_hallmark(name)
+    return (0, _HALLMARK_ORDER.index(c)) if c in _HALLMARK_ORDER else (1, _natural_key(c))
+
+def _parse_attrs(text: str) -> Dict[str, str]:
+    out = {}
+    for raw in str(text or "").split(";"):
+        part = raw.strip()
+        if not part:
+            continue
+        if "=" in part:
+            k, v = part.split("=", 1)
+        elif " " in part:
+            k, v = part.split(None, 1)
+            v = v.strip().strip('"')
+        else:
+            continue
+        out[k.strip()] = unquote(v.strip().strip('"'))
+    return out
+
+def _merge_host_intervals(intervals: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    merged = []
+    for s, e in sorted((min(s,e), max(s,e)) for s,e in intervals):
+        if merged and s <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s,e))
+    return merged
+
+def parse_host_gff(path: Optional[Path]) -> Dict[str, List[Tuple[int, int]]]:
+    if path is None:
+        return {}
+    if not path.is_file():
+        raise SystemExit(f"Error: GFF file not found: {path}")
+    gene_like = {"gene","mrna","transcript","primary_transcript","lncrna","ncrna","rrna","trna","snorna","snrna","mirna","pseudogene","pseudogenic_transcript"}
+    parts = {"cds","exon"}
+    ignored = {"intron","start_codon","stop_codon","five_prime_utr","three_prime_utr","5utr","3utr","utr"}
+    by_contig = defaultdict(list)
+    by_parent = defaultdict(list)
+    opener = gzip.open if str(path).endswith(".gz") else open
+    with opener(path, "rt", encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            if not raw.strip() or raw.startswith("#"):
+                continue
+            c = raw.rstrip("\n").split("\t")
+            if len(c) < 5:
+                continue
+            try:
+                s, e = sorted((int(c[3]), int(c[4])))
+            except ValueError:
+                continue
+            feature = c[2].lower()
+            if feature in ignored:
+                continue
+            attrs = _parse_attrs(c[8] if len(c) > 8 else "")
+            if feature in gene_like or any(x in feature for x in ("gene","transcript","mrna")):
+                by_contig[c[0]].append((s,e))
+            elif feature in parts or any(x in feature for x in ("cds","exon")):
+                by_contig[c[0]].append((s,e))
+                parent = attrs.get("Parent") or attrs.get("parent") or attrs.get("transcript_id") or attrs.get("gene_id") or attrs.get("ID")
+                if parent:
+                    for p in parent.split(","):
+                        by_parent[(c[0], p.strip())].append((s,e))
+    for (contig, _), spans in by_parent.items():
+        by_contig[contig].append((min(x[0] for x in spans), max(x[1] for x in spans)))
+    out = {c:_merge_host_intervals(v) for c,v in by_contig.items() if v}
+    _LOG.info(f"Host GFF mask: {sum(len(v) for v in out.values()):,} merged interval(s) on {len(out):,} contig(s)")
+    return out
+
+def _contained(intervals: List[Tuple[int,int]], start: int, end: int) -> bool:
+    lo, hi = 0, len(intervals)
+    while lo < hi:
+        mid = (lo + hi)//2
+        if intervals[mid][0] <= start: lo = mid + 1
+        else: hi = mid
+    i = lo - 1
+    return i >= 0 and intervals[i][0] <= start and intervals[i][1] >= end
+
+def predict_review_orfs(record: dict, seqs: Dict[str,str], host: Dict[str,List[Tuple[int,int]]]) -> List[ReviewOrf]:
+    seq = fetch_seq(seqs, record["contig"], record["geve_start"], record["geve_end"])
+    try:
+        genes = pyrodigal_gv.ViralGeneFinder(meta=True).find_genes(seq.encode("ascii"))
+    except Exception as exc:
+        raise SystemExit(f"Error: pyrodigal-gv failed for {record['contig']}:{record['geve_start']}-{record['geve_end']}: {exc}") from exc
+    out = []
+    masked = 0
+    predicted = 0
+    for i, gene in enumerate(genes, 1):
+        predicted += 1
+        start = record["geve_start"] + int(gene.begin) - 1
+        end = record["geve_start"] + int(gene.end) - 1
+        if _contained(host.get(record["contig"], []), start, end):
+            masked += 1
+            continue
+        protein = gene.translate().rstrip("*")
+        if protein:
+            out.append(ReviewOrf(f"{record['reviewed_geve_name']}__orf{i:05d}", record["contig"], start, end, int(gene.strand), protein))
+    _LOG.info(f"Pyrodigal-GV: predicted {predicted:,} ORF(s), removed {masked:,} by host GFF, retained {len(out):,}")
+    return out
+
+def _digital(orfs: List[ReviewOrf]):
+    aa = pyhmmer.easel.Alphabet.amino()
+    return [pyhmmer.easel.TextSequence(name=o.orf_id.encode(), sequence=o.protein).digitize(aa) for o in orfs if len(o.protein) <= 100000]
+
+def _hmm_name(hits) -> str:
+    try: x = hits.query.name
+    except AttributeError: x = hits.query_name
+    return x.decode() if isinstance(x, bytes) else str(x)
+
+def scan_changed_orfs(orfs: List[ReviewOrf], db: Path, evalue: float, threads: int) -> None:
+    if not orfs:
+        return
+    hallmark_db = db / "NCLDV_markers.hmm"
+    gvog_db = db / "gvog.complete.hmm"
+    pfam_db = db / "Pfam-A.hmm"
+    for req in (hallmark_db, gvog_db):
+        if not req.is_file():
+            raise SystemExit(f"Error: required database file not found: {req}")
+    by_id = {o.orf_id:o for o in orfs}
+    seqs = _digital(orfs)
+    if not seqs:
+        _LOG.warning("No changed ORFs were eligible for HMM scanning")
+        return
+    with pyhmmer.plan7.HMMFile(str(hallmark_db)) as hf:
+        hmms = list(hf)
+    for hits in pyhmmer.hmmsearch(hmms, seqs, cpus=max(1, threads), E=evalue):
+        name = _canon_hallmark(_hmm_name(hits))
+        cutoff = _HALLMARK_SCORE_CUTOFFS.get(name, 0.0)
+        for hit in hits:
+            if not hit.included or float(hit.score) < cutoff: continue
+            target = hit.name.decode() if isinstance(hit.name, bytes) else str(hit.name)
+            o = by_id.get(target)
+            if o and float(hit.score) > o.hallmark_bitscore:
+                o.hallmark, o.hallmark_bitscore, o.hallmark_evalue = name, float(hit.score), float(hit.evalue)
+                o.virbit = max(o.virbit, float(hit.score))
+    with pyhmmer.plan7.HMMFile(str(gvog_db)) as hf:
+        for hits in pyhmmer.hmmsearch(hf, seqs, cpus=max(1, threads), E=evalue):
+            name = _hmm_name(hits)
+            for hit in hits:
+                if not hit.included: continue
+                target = hit.name.decode() if isinstance(hit.name, bytes) else str(hit.name)
+                o = by_id.get(target)
+                if o and float(hit.score) > o.gvog_bitscore:
+                    o.gvog, o.gvog_bitscore, o.gvog_evalue = name, float(hit.score), float(hit.evalue)
+                    o.virbit = max(o.virbit, float(hit.score))
+    if pfam_db.is_file():
+        with pyhmmer.plan7.HMMFile(str(pfam_db)) as hf:
+            for hits in pyhmmer.hmmsearch(hf, seqs, cpus=max(1, threads), E=evalue):
+                name = _hmm_name(hits)
+                try:
+                    raw = hits.query.accession
+                    acc = (raw.decode() if isinstance(raw, bytes) else raw) or name
+                    acc = acc.split(".")[0]
+                except AttributeError:
+                    acc = name
+                for hit in hits:
+                    if not hit.included: continue
+                    target = hit.name.decode() if isinstance(hit.name, bytes) else str(hit.name)
+                    o = by_id.get(target)
+                    if o and float(hit.score) > o.best_pfam_bitscore:
+                        o.best_pfam_acc, o.best_pfam_name = acc, name
+                        o.best_pfam_bitscore, o.best_pfam_evalue = float(hit.score), float(hit.evalue)
+                        o.pfambit = float(hit.score)
+    for o in orfs:
+        o.net_score = o.virbit - o.pfambit
+
+def original_orfs(record: dict, marker: pd.DataFrame, seqs: Dict[str,str]) -> List[ReviewOrf]:
+    q = marker[(marker["geve_name"].astype(str) == record["original_geve_name"]) & (~marker["feature"].astype(str).isin(FEATURE_IGNORE))].copy()
+    out = []
+    q["_s"] = q["start"].map(_safe_int); q["_e"] = q["end"].map(_safe_int)
+    q = q.dropna(subset=["_s","_e"]).sort_values(["_s","_e"])
+    for i, (_, row) in enumerate(q.iterrows(), 1):
+        s,e = int(row["_s"]), int(row["_e"])
+        if s < record["geve_start"] or e > record["geve_end"]: continue
+        strand = -1 if str(row.get("strand","+")) == "-" else 1
+        cds = fetch_seq(seqs, record["contig"], s, e)
+        if strand < 0: cds = revcomp(cds)
+        o = ReviewOrf(f"{record['reviewed_geve_name']}__orf{i:05d}", record["contig"], s,e,strand,translate_cds(cds))
+        feature, name = str(row.get("feature","")), str(row.get("name","") or "")
+        score, ev = _safe_float(row.get("score"),0.0), _safe_float(row.get("e_value"),float("inf"))
+        if feature == "hallmark": o.hallmark, o.hallmark_bitscore, o.hallmark_evalue = _canon_hallmark(name), score, ev; o.virbit=score
+        elif feature == "gvog": o.gvog, o.gvog_bitscore, o.gvog_evalue = name, score, ev; o.virbit=score
+        elif feature == "pfam": o.best_pfam_name, o.best_pfam_acc, o.best_pfam_bitscore, o.best_pfam_evalue = name,name,score,ev; o.pfambit=score
+        o.net_score = o.virbit - o.pfambit
+        out.append(o)
+    return out
+
+def _valid_original_tir(marker: pd.DataFrame, old: str, start: int, end: int):
+    tir, tsd = get_original_tir_tsd(marker, old)
+    if tir and tir.left_start >= start and tir.right_end <= end:
+        return tir, tsd
+    return None, None
+
+def build_v2_records(review: pd.DataFrame, summary: pd.DataFrame, marker: pd.DataFrame, seqs: Dict[str,str], host, db: Path, evalue: float, threads: int, prefix: str):
+    smap = {str(r["geve_name"]):r for _,r in summary.iterrows()}
+    temp = []
+    for _, row in review[review["action"] != "remove"].iterrows():
+        start = int(row["review_start"] if row["action"] == "change" else row["original_start"])
+        end = int(row["review_end"] if row["action"] == "change" else row["original_end"])
+        contig = str(row["contig"])
+        if contig not in seqs: raise SystemExit(f"Error: contig not found in genome: {contig}")
+        if start < 1 or end > len(seqs[contig]) or start >= end:
+            raise SystemExit(f"Error: invalid reviewed coordinates for {row['geve_name']}: {contig}:{start}-{end} (contig length {len(seqs[contig])})")
+        temp.append(dict(original_geve_name=row["geve_name"], action=row["action"], contig=contig, geve_start=start, geve_end=end, geve_length=end-start+1, original_summary=smap[row["geve_name"]].to_dict()))
+    temp.sort(key=lambda r: (_natural_key(r["contig"]), r["geve_start"], r["geve_end"], _natural_key(r["original_geve_name"])))
+    all_changed = []
+    for i, r in enumerate(temp,1):
+        r["reviewed_geve_name"] = f"{prefix}_GEVE_{i:03d}"
+        r["geve_id"] = r["reviewed_geve_name"]
+        r["gc_geve"] = gc_of_seq(fetch_seq(seqs,r["contig"],r["geve_start"],r["geve_end"]))
+        r["tir"], r["tsd"] = _valid_original_tir(marker,r["original_geve_name"],r["geve_start"],r["geve_end"])
+        r["has_tir"] = r["tir"] is not None
+        if r["action"] == "change":
+            r["orfs"] = predict_review_orfs(r, seqs, host); all_changed.extend(r["orfs"])
+        else:
+            r["orfs"] = original_orfs(r, marker, seqs)
+    scan_changed_orfs(all_changed, db, evalue, threads)
+    for r in temp:
+        r["orfs"].sort(key=lambda o:(o.start,o.end,o.strand))
+        hs = sorted({o.hallmark for o in r["orfs"] if o.hallmark}, key=_hallmark_key)
+        r["hallmarks_present"], r["n_hallmarks"] = hs, sum(1 for o in r["orfs"] if o.hallmark)
+    return temp
+
+def coding_density_v2(orfs, start, end):
+    spans=[]
+    for o in orfs:
+        s,e=max(start,o.start),min(end,o.end)
+        if s<=e: spans.append((s,e))
+    merged=_merge_host_intervals(spans)
+    return round(sum(e-s+1 for s,e in merged)/(end-start+1),4) if end>=start else 0.0
+
+def load_gvog_names(db: Path):
+    p=db/"gvog.complete.annot.tsv"
+    if not p.is_file(): return {}
+    try: df=pd.read_csv(p,sep="\t",dtype=str,keep_default_na=False)
+    except Exception: return {}
+    if not {"GVOG","NCVOG_descs"}.issubset(df.columns): return {}
+    return {r["GVOG"]:r["NCVOG_descs"].split(" | ")[0].strip() for _,r in df.iterrows() if r["GVOG"]}
+
+def write_v2_summary(records, path):
+    rows=[]
+    for g in records:
+        row=dict(contig_id=g["contig"],geve_name=g["geve_id"],start=g["geve_start"],end=g["geve_end"],geve_length=g["geve_length"],gc=round(g["gc_geve"],2),total_cds=len(g["orfs"]),NCLDV_hits=sum(1 for o in g["orfs"] if o.hallmark or o.gvog),coding_density=coding_density_v2(g["orfs"],g["geve_start"],g["geve_end"]),n_hallmarks=g["n_hallmarks"],hallmarks=",".join(g["hallmarks_present"]),has_tir="yes" if g["tir"] else "no")
+        row.update(tir_fields(g["tir"])); row.update(tsd_fields(g["tsd"])); rows.append(row)
+    pd.DataFrame(rows,columns=["contig_id","geve_name","start","end","geve_length","gc","total_cds","NCLDV_hits","coding_density","n_hallmarks","hallmarks","has_tir","tir_length","tir_score","tir_identity_pct","tir_gaps","tsd_len","tsd_left","tsd_right","tsd_mismatch","tsd_conservation"]).to_csv(path,sep="\t",index=False)
+
+def _fmt_ev(x): return "NA" if x is None or x==float("inf") or not math.isfinite(x) else f"{x:.2e}"
+def _fmt_sc(x): return "NA" if not x or x<=0 else f"{x:.1f}"
+
+def write_v2_outputs(records, seqs, outdir, file_prefix, db):
+    summary=outdir/f"{file_prefix}.summary.tsv"; marker=outdir/f"{file_prefix}.markerout"; bed=outdir/f"{file_prefix}.geve.bed"; fna=outdir/f"{file_prefix}.geve.fna"; gff=outdir/f"{file_prefix}.geve.gff3"; cds=outdir/f"{file_prefix}.geve.cds"; pep=outdir/f"{file_prefix}.geve.pep"; func=outdir/f"{file_prefix}.func.tsv"
+    write_v2_summary(records,summary)
+    with fna.open("w") as fh:
+        for g in records:
+            fh.write(f">{g['geve_id']} contig={g['contig']} start={g['geve_start']} end={g['geve_end']} length={g['geve_length']} hallmarks={','.join(g['hallmarks_present'])} gc={g['gc_geve']:.2f}%\n{wrap_fasta(fetch_seq(seqs,g['contig'],g['geve_start'],g['geve_end']))}\n")
+    with cds.open("w") as cf, pep.open("w") as pf, gff.open("w") as gf:
+        gf.write("##gff-version 3\n")
+        for g in records:
+            gid=g["geve_id"]; gf.write(f"{g['contig']}\tfindGEVE\tmobile_genetic_element\t{g['geve_start']}\t{g['geve_end']}\t.\t+\t.\tID={gid};Name={gid}\n")
+            tir = g["tir"]
+            tsd = g["tsd"]
+            if tir is not None:
+                gf.write(f"{g['contig']}\tfindGEVE\tterminal_inverted_repeat\t{tir.left_start}\t{tir.left_end}\t.\t+\t.\tID={gid}.TIR_left;Parent={gid}\n")
+                gf.write(f"{g['contig']}\tfindGEVE\tterminal_inverted_repeat\t{tir.right_start}\t{tir.right_end}\t.\t-\t.\tID={gid}.TIR_right;Parent={gid}\n")
+                if tsd is not None:
+                    le = tir.left_start - 1 - tsd.left_shift
+                    ls = le - tsd.length + 1
+                    rs = tir.right_end + 1 + tsd.right_shift
+                    re = rs + tsd.length - 1
+                    gf.write(f"{g['contig']}\tfindGEVE\ttarget_site_duplication\t{ls}\t{le}\t.\t+\t.\tID={gid}.TSD_5p;Parent={gid}\n")
+                    gf.write(f"{g['contig']}\tfindGEVE\ttarget_site_duplication\t{rs}\t{re}\t.\t+\t.\tID={gid}.TSD_3p;Parent={gid}\n")
+            for i,o in enumerate(g["orfs"],1):
+                lab=f"orf{i:05d}"; strand="+" if o.strand>=0 else "-"; nt=fetch_seq(seqs,o.contig,o.start,o.end); nt=revcomp(nt) if o.strand<0 else nt; extra=f" {o.hallmark}" if o.hallmark else ""
+                cf.write(f">{gid}_{lab}{extra} length={len(nt)}\n{wrap_fasta(nt)}\n"); pf.write(f">{gid}_{lab}{extra} length={len(o.protein)}\n{wrap_fasta(o.protein)}\n")
+                score=f"{o.hallmark_bitscore:.1f}" if o.hallmark else "."; attrs=f"ID={gid}.{lab};Parent={gid};Name={lab}"+(f";hallmark={o.hallmark}" if o.hallmark else "")
+                gf.write(f"{o.contig}\tfindGEVE\tCDS\t{o.start}\t{o.end}\t{score}\t{strand}\t0\t{attrs}\n")
+    with marker.open("w") as fh:
+        fh.write("contig\tgeve_name\tfeature\tname\tstart\tend\tstrand\te_value\tscore\n")
+        for g in records:
+            gid=g["geve_id"]; flank=viz_flank_size(g["geve_length"]); rs=max(1,g["geve_start"]-flank); re=min(len(seqs[g["contig"]]),g["geve_end"]+flank)
+            fh.write(f"{g['contig']}\t{gid}\tGEVE\t.\t{g['geve_start']}\t{g['geve_end']}\t.\tNA\t{g['geve_length']}\n")
+            if rs<g["geve_start"]: fh.write(f"{g['contig']}\t{gid}\tflank_left\t.\t{rs}\t{g['geve_start']-1}\t.\tNA\tNA\n")
+            if re>g["geve_end"]: fh.write(f"{g['contig']}\t{gid}\tflank_right\t.\t{g['geve_end']+1}\t{re}\t.\tNA\tNA\n")
+            tir = g["tir"]
+            tsd = g["tsd"]
+            if tir is not None:
+                fh.write(f"{g['contig']}\t{gid}\tTIR_left\t.\t{tir.left_start}\t{tir.left_end}\t+\tNA\t{tir.score}\n")
+                fh.write(f"{g['contig']}\t{gid}\tTIR_right\t.\t{tir.right_start}\t{tir.right_end}\t-\tNA\t{tir.score}\n")
+                if tsd is not None:
+                    le = tir.left_start - 1 - tsd.left_shift
+                    ls = le - tsd.length + 1
+                    rs = tir.right_end + 1 + tsd.right_shift
+                    re2 = rs + tsd.length - 1
+                    fh.write(f"{g['contig']}\t{gid}\tTSD_5p\t{tsd.sequence_left}\t{ls}\t{le}\t+\tNA\t{tsd.identity:.1f}\n")
+                    fh.write(f"{g['contig']}\t{gid}\tTSD_3p\t{tsd.sequence_right}\t{rs}\t{re2}\t+\tNA\t{tsd.identity:.1f}\n")
+            for o in g["orfs"]:
+                strand="+" if o.strand>=0 else "-"
+                if o.hallmark: feat,name,ev,sc="hallmark",o.hallmark,_fmt_ev(o.hallmark_evalue),_fmt_sc(o.hallmark_bitscore)
+                elif o.gvog: feat,name,ev,sc="gvog",o.gvog,_fmt_ev(o.gvog_evalue),_fmt_sc(o.gvog_bitscore)
+                elif o.best_pfam_acc: feat,name,ev,sc="pfam",o.best_pfam_name or o.best_pfam_acc,_fmt_ev(o.best_pfam_evalue),_fmt_sc(o.best_pfam_bitscore)
+                else: feat,name,ev,sc="orf",".","NA","NA"
+                fh.write(f"{o.contig}\t{gid}\t{feat}\t{name}\t{o.start}\t{o.end}\t{strand}\t{ev}\t{sc}\n")
+    rows=[]
+    names=load_gvog_names(db)
+    for g in records:
+        for i,o in enumerate(g["orfs"],1):
+            if not (o.hallmark or o.gvog or o.best_pfam_acc): continue
+            rows.append(dict(geve_id=g["geve_id"],protein_id=f"orf{i:05d}",gvog_bitscore=_fmt_sc(o.gvog_bitscore),gvog_evalue=_fmt_ev(o.gvog_evalue),gvog_id=o.gvog or "NA",gvog_name=names.get(o.gvog,"NA") if o.gvog else "NA",pfam_bitscore=_fmt_sc(o.best_pfam_bitscore),pfam_evalue=_fmt_ev(o.best_pfam_evalue),pfam_id=o.best_pfam_acc or "NA",pfam_name=o.best_pfam_name or "NA"))
+    pd.DataFrame(rows,columns=["geve_id","protein_id","gvog_bitscore","gvog_evalue","gvog_id","gvog_name","pfam_bitscore","pfam_evalue","pfam_id","pfam_name"]).to_csv(func,sep="\t",index=False)
+    byh=defaultdict(dict)
+    for g in records:
+        for o in g["orfs"]:
+            if o.hallmark and (g["geve_id"] not in byh[o.hallmark] or len(o.protein)>len(byh[o.hallmark][g["geve_id"]].protein)): byh[o.hallmark][g["geve_id"]]=o
+    hdir=outdir/"hallmark"
+    if hdir.is_dir():
+        for old in hdir.glob(f"{file_prefix}.*.pep"):
+            old.unlink()
+    if byh:
+        hdir.mkdir(exist_ok=True)
+        for h in sorted(byh,key=_hallmark_key):
+            with (hdir/f"{file_prefix}.{h}.pep").open("w") as fh:
+                for gid,o in sorted(byh[h].items(),key=lambda x:_natural_key(x[0])): fh.write(f">{gid}_{h}\n{wrap_fasta(o.protein)}\n")
+    elif hdir.is_dir() and not any(hdir.iterdir()):
+        hdir.rmdir()
+    rolling={}
+    for g in records:
+        vals={}
+        a=g["orfs"]
+        for i,o in enumerate(a):
+            lo=max(0,i-7); hi=min(len(a),i+8); vals[o.orf_id]=sum(x.net_score for x in a[lo:hi])/(hi-lo) if hi-lo>=3 else 0.0
+        rolling[g["geve_id"]]=vals
+    rows=[]
+    for g in records:
+        flank=viz_flank_size(g["geve_length"]); rs=max(1,g["geve_start"]-flank); re=min(len(seqs[g["contig"]]),g["geve_end"]+flank); w=rs
+        while w+999<=re:
+            we=w+999; sub=fetch_seq(seqs,g["contig"],w,we); gc=gc_of_seq(sub); ovs=[o for o in g["orfs"] if o.end>=w and o.start<=we]; rv=[rolling[g["geve_id"]][o.orf_id] for o in ovs]
+            center=(w+we)//2; rt="flank_left" if center<g["geve_start"] else ("geve" if center<=g["geve_end"] else "flank_right")
+            rows.append(dict(contig_id=g["contig"], window_start=w, window_end=we, geve_name=g["geve_id"], rel_start=w-g["geve_start"], rel_end=we-g["geve_start"], region_type=rt, gc="NA" if math.isnan(gc) else f"{gc:.3f}", rolling_score_mean="NA" if not rv else f"{sum(rv)/len(rv):.4f}", n_orfs=len(ovs), gvog_hits=sum(1 for o in ovs if o.hallmark or o.gvog), pfam_hits=sum(1 for o in ovs if o.best_pfam_acc)))
+            w += 250
+    pd.DataFrame(rows,columns=["contig_id","window_start","window_end","geve_name","rel_start","rel_end","region_type","gc","rolling_score_mean","n_orfs","gvog_hits","pfam_hits"]).to_csv(bed,sep="\t",index=False)
+    return summary,marker,bed
+
+def validate_database(db: Path) -> None:
+    if not db.is_dir():
+        raise SystemExit(f"Error: database directory not found: {db}")
+    for name in ("NCLDV_markers.hmm", "gvog.complete.hmm"):
+        path = db / name
+        if not path.is_file():
+            raise SystemExit(f"Error: required database file not found: {path}")
+
+
+def default_region_outdir(base: Optional[Path]) -> Path:
+    root = base if base is not None else Path.cwd()
+    date_tag = datetime.now().strftime("%Y%m%d")
+    out = root / f"Result_{date_tag}"
+    if not out.exists():
+        return out
+    idx = 1
+    while True:
+        candidate = root / f"Result_{date_tag}_{idx:02d}"
+        if not candidate.exists():
+            return candidate
+        idx += 1
+
+
+def prepare_outdir(outdir: Path, overwrite: bool) -> None:
+    if outdir.exists() and any(outdir.iterdir()) and not overwrite:
+        raise SystemExit(f"Error: output directory is not empty; use --overwrite: {outdir}")
+    outdir.mkdir(parents=True, exist_ok=True)
+
+
 def apply_review(args) -> None:
     summary = _read_table(args.summary, "summary")
     marker = _read_table(args.markerout, "markerout")
-    bed = _read_table(args.bed, "geve.bed")
-    review_raw = read_review_xlsx(args.review)
-    review, errors, warnings = validate_review(review_raw, summary)
-    prefix = args.prefix or infer_prefix(args.summary, summary)
-    outdir = args.outdir or default_outdir(args.outbase)
-    if outdir.exists() and any(outdir.iterdir()) and not args.overwrite:
-        raise SystemExit(f"Error: output directory is not empty; use --overwrite: {outdir}")
-    outdir.mkdir(parents=True, exist_ok=True)
-    setup_logging(outdir / "review.log")
+    review,errors,warnings=validate_review(read_review_xlsx(args.review),summary)
+    prefix=args.prefix or infer_prefix(args.summary,summary); outdir=args.outdir or default_outdir(args.outbase)
+    prepare_outdir(outdir, args.overwrite); setup_logging(outdir/"review.log")
+    if errors:
+        for x in errors:_LOG.error(x)
+        raise SystemExit(f"Error: review validation failed with {len(errors)} error(s)")
+    for x in warnings:_LOG.warning(x)
+    if args.genome is None: raise SystemExit("Error: --genome is required for review reannotation")
+    validate_database(args.db)
+    _require_columns(marker, ["contig", "geve_name", "feature", "name", "start", "end", "strand", "e_value", "score"], "markerout")
+    seqs=read_fasta(args.genome); host=parse_host_gff(args.gff)
+    records=build_v2_records(review,summary,marker,seqs,host,args.db,args.evalue,args.threads,prefix)
+    file_prefix=f"{prefix}.reviewed"; sp,mp,bp=write_v2_outputs(records,seqs,outdir,file_prefix,args.db)
+    if not args.no_plot: run_geve_plot(mp,bp,outdir)
+    _LOG.info(f"Retained {len(records):,} GEVE(s); removed {int((review['action']=='remove').sum()):,}; reannotated {int((review['action']=='change').sum()):,}")
+    if (outdir / "hallmark").is_dir():
+        _LOG.output(f"Wrote hallmark protein folder: {outdir / 'hallmark'}")
+    else:
+        _LOG.info("No hallmark proteins detected; hallmark output directory was not created")
+    _LOG.output(f"Wrote {sp}")
 
-    _LOG.info("findGEVE review started")
-    _LOG.info(f"Command line | {' '.join(sys.argv)}")
-    _LOG.info(f"Review file | {args.review}")
-    _LOG.info(f"Summary file | {args.summary}")
-    _LOG.info(f"Markerout file | {args.markerout}")
-    _LOG.info(f"BED file | {args.bed}")
+
+
+def _parse_region_values(values: List[str], label: str, integer: bool = False):
+    text = " ".join(str(value) for value in values).strip()
+    parts = [part.strip() for part in text.split(",")]
+    if not parts or any(not part for part in parts):
+        raise SystemExit(f"Error: {label} contains an empty value")
+    if not integer:
+        return parts
+    parsed = []
+    for part in parts:
+        try:
+            parsed.append(int(part))
+        except ValueError as exc:
+            raise SystemExit(f"Error: {label} contains a non-integer value: {part}") from exc
+    return parsed
+
+
+def inspect_region(args) -> None:
+    prefix = str(args.prefix).strip()
+    if not prefix:
+        raise SystemExit("Error: --prefix must not be empty")
+    if args.threads < 1:
+        raise SystemExit("Error: --threads must be at least 1")
+    if args.evalue <= 0:
+        raise SystemExit("Error: --evalue must be greater than 0")
+
+    contigs = _parse_region_values(args.ctg, "--ctg")
+    starts = _parse_region_values(args.start, "--start", integer=True)
+    ends = _parse_region_values(args.end, "--end", integer=True)
+    if not (len(contigs) == len(starts) == len(ends)):
+        raise SystemExit(
+            "Error: --ctg, --start, and --end must contain the same number of values "
+            f"(received {len(contigs)}, {len(starts)}, and {len(ends)})"
+        )
+
+    validate_database(args.db)
+    outdir = args.outdir or default_region_outdir(args.outbase)
+    prepare_outdir(outdir, args.overwrite)
+    setup_logging(outdir / "region.log")
+    _LOG.info("findGEVE region inspection started")
     _LOG.info(f"Genome file | {args.genome}")
+    _LOG.info(f"Database directory | {args.db}")
+    _LOG.info(f"Candidate regions | {len(contigs):,}")
     _LOG.info(f"Output directory | {outdir}")
 
-    if errors:
-        for err in errors:
-            _LOG.error(err)
-        raise SystemExit(f"Error: review validation failed with {len(errors)} error(s); see {outdir / 'review.log'}")
-    for warn in warnings:
-        _LOG.warning(warn)
+    seqs = read_fasta(args.genome)
+    regions = []
+    for index, (contig, start, end) in enumerate(zip(contigs, starts, ends), 1):
+        if contig not in seqs:
+            raise SystemExit(f"Error: candidate {index}: contig not found in genome: {contig}")
+        contig_length = len(seqs[contig])
+        if start < 1 or end > contig_length or start >= end:
+            raise SystemExit(
+                f"Error: candidate {index}: invalid region coordinates: "
+                f"{contig}:{start}-{end} (contig length {contig_length})"
+            )
+        regions.append((contig, start, end))
+        _LOG.info(f"Candidate {index:03d} | {contig}:{start}-{end}")
 
-    seqs = read_fasta(args.genome) if args.genome is not None else {}
-    if args.genome is not None:
-        _LOG.info(f"Loaded genome FASTA: {len(seqs):,} contig(s)")
-    else:
-        _LOG.warning("Genome FASTA not provided; FASTA/CDS/PEP output will be empty and changed-GEVE TIR search will be skipped")
+    host = parse_host_gff(args.gff)
+    records = []
+    all_orfs = []
+    for index, (contig, start, end) in enumerate(regions, 1):
+        geve_id = f"{prefix}_GEVE_{index:03d}"
+        record = dict(
+            original_geve_name=geve_id,
+            reviewed_geve_name=geve_id,
+            geve_id=geve_id,
+            action="region",
+            contig=contig,
+            geve_start=start,
+            geve_end=end,
+            geve_length=end - start + 1,
+            tir=None,
+            tsd=None,
+            has_tir=False,
+        )
+        record["gc_geve"] = gc_of_seq(fetch_seq(seqs, contig, start, end))
+        record["orfs"] = predict_review_orfs(record, seqs, host)
+        all_orfs.extend(record["orfs"])
+        records.append(record)
 
-    cfg = dict(
-        tir_flank=args.tir_flank,
-        tir_min_len=args.tir_min_len,
-        tir_max_len=args.tir_max_len,
-        tir_min_id=args.tir_min_id,
-        tir_min_insert=args.tir_min_insert,
-        tir_max_insert=args.tir_max_insert,
-        tir_edge_slop=args.tir_edge_slop,
-        tir_bracket_slop_frac=args.tir_bracket_slop_frac,
-        tir_bracket_fraction=args.tir_bracket_fraction,
-        tir_min_dinuc_entropy=args.tir_min_dinuc_entropy,
-        tir_max_kmer_fraction=args.tir_max_kmer_fraction,
-        tir_max_tandem_fraction=args.tir_max_tandem_fraction,
-        tir_tandem_max_period=args.tir_tandem_max_period,
-        blastn_word_size=args.blastn_word_size,
-        blastn_reward=args.blastn_reward,
-        blastn_penalty=args.blastn_penalty,
-        blastn_gapopen=args.blastn_gapopen,
-        blastn_gapextend=args.blastn_gapextend,
-        blastn_evalue=args.blastn_evalue,
-        blastn_max_targets=args.blastn_max_targets,
-        tsd_min_len=args.tsd_min_len,
-        tsd_max_len=args.tsd_max_len,
-        tsd_max_slide=args.tsd_max_slide,
-        tsd_flank=args.tsd_flank,
-    )
-    _LOG.info(f"Review TIR flank | {args.tir_flank:,} bp")
+    scan_changed_orfs(all_orfs, args.db, args.evalue, args.threads)
+    for record in records:
+        record["orfs"].sort(key=lambda o: (o.start, o.end, o.strand))
+        record["hallmarks_present"] = sorted(
+            {o.hallmark for o in record["orfs"] if o.hallmark},
+            key=_hallmark_key,
+        )
+        record["n_hallmarks"] = sum(1 for o in record["orfs"] if o.hallmark)
 
-    n_remove = int((review["action"] == "remove").sum())
-    n_change = int((review["action"] == "change").sum())
-    _LOG.info(f"Review rows | total={len(review):,} unchanged={int((review['action'] == 'unchanged').sum()):,} change={n_change:,} remove={n_remove:,}")
-
-    records, tir_messages = build_reviewed_records(review, summary, marker, seqs, cfg, args.threads)
-    for msg in tir_messages:
-        _LOG.info(msg)
-
-    summary_path = outdir / f"{prefix}.reviewed.summary.tsv"
-    marker_path = outdir / f"{prefix}.reviewed.markerout"
-    bed_path = outdir / f"{prefix}.reviewed.geve.bed"
-    fna_path = outdir / f"{prefix}.reviewed.geve.fna"
-    gff_path = outdir / f"{prefix}.reviewed.geve.gff3"
-    cds_path = outdir / f"{prefix}.reviewed.geve.cds"
-    pep_path = outdir / f"{prefix}.reviewed.geve.pep"
-    hallmark_dir = outdir / "hallmark"
-
-    write_reviewed_summary(records, summary_path)
-    _LOG.output(f"Wrote {summary_path}")
-    write_reviewed_markerout(records, marker, seqs, marker_path)
-    _LOG.output(f"Wrote {marker_path}")
-    write_reviewed_bed(records, bed, bed_path)
-    _LOG.output(f"Wrote {bed_path}")
-    write_reviewed_fna(records, seqs, fna_path)
-    _LOG.output(f"Wrote {fna_path}")
-    write_reviewed_gff3(records, marker, gff_path)
-    _LOG.output(f"Wrote {gff_path}")
-    write_reviewed_cds_pep(records, marker, seqs, cds_path, pep_path, hallmark_dir, prefix)
-    _LOG.output(f"Wrote {cds_path}")
-    _LOG.output(f"Wrote {pep_path}")
-    _LOG.output(f"Wrote hallmark protein folder: {hallmark_dir}")
-
+    summary_path, marker_path, bed_path = write_v2_outputs(records, seqs, outdir, prefix, args.db)
     if not args.no_plot:
         run_geve_plot(marker_path, bed_path, outdir)
+    for record in records:
+        _LOG.info(
+            f"Candidate retained: {record['geve_id']} | {record['contig']}:"
+            f"{record['geve_start']}-{record['geve_end']} | "
+            f"ORFs={len(record['orfs']):,} | hallmarks={record['n_hallmarks']:,}"
+        )
+    if (outdir / "hallmark").is_dir():
+        _LOG.output(f"Wrote hallmark protein folder: {outdir / 'hallmark'}")
+    else:
+        _LOG.info("No hallmark proteins detected; hallmark output directory was not created")
+    _LOG.output(f"Wrote {summary_path}")
 
-    _LOG.info("Result Summary")
-    _LOG.info(f"GEVE reviewed: {len(review):,}")
-    _LOG.info(f"  Retained: {len(records):,}")
-    _LOG.info(f"  Removed:  {n_remove:,}")
-    _LOG.info(f"  Changed:  {n_change:,}")
-    n_tir = sum(1 for r in records if r["tir"] is not None)
-    _LOG.info(f"  With TIR: {n_tir:,}")
-    _LOG.info(f"Review log: {outdir / 'review.log'}")
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Manual review helper for findGEVE results.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=HELP_TEXT,
-    )
-    sub = parser.add_subparsers(dest="command", required=True)
-    p_template = sub.add_parser("make-template", help="Create <prefix>.review.xlsx")
-    p_template.add_argument("summary", type=Path, help="Input <prefix>.summary.tsv")
-    p_template.add_argument("--overwrite", action="store_true", help="Overwrite existing output")
-    p_apply = sub.add_parser("apply", help="Apply reviewed Excel file")
-    p_apply.add_argument("--review", required=True, type=Path, help="Reviewed Excel file")
-    p_apply.add_argument("--summary", required=True, type=Path, help="Original <prefix>.summary.tsv")
-    p_apply.add_argument("--markerout", required=True, type=Path, help="Original <prefix>.markerout")
-    p_apply.add_argument("--bed", required=True, type=Path, help="Original <prefix>.geve.bed")
-    p_apply.add_argument("--genome", type=Path, help="Genome FASTA; gzip is acceptable")
-    p_apply.add_argument("--prefix", help="Output prefix; inferred from summary when omitted")
-    p_apply.add_argument("--outdir", type=Path, help="Output review directory")
-    p_apply.add_argument("--outbase", type=Path, help="Base directory for automatic Review_<YYYYMMDD> output folder")
-    p_apply.add_argument("--overwrite", action="store_true", help="Allow writing into a non-empty output directory")
-    p_apply.add_argument("--no-plot", action="store_true", help="Skip automatic plotting")
-    p_apply.add_argument("-t", "--threads", type=int, default=1, help="blastn threads [default: 1]")
-    p_apply.add_argument("--tir-flank", type=int, default=50_000, help="TIR search flank around changed interval [default: 50_000]")
-    p_apply.add_argument("--tir-min-len", type=int, default=10)
-    p_apply.add_argument("--tir-max-len", type=int, default=10_000)
-    p_apply.add_argument("--tir-min-id", type=float, default=65.0)
-    p_apply.add_argument("--tir-min-insert", type=int, default=30_000)
-    p_apply.add_argument("--tir-max-insert", type=int, default=2_500_000)
-    p_apply.add_argument("--tir-edge-slop", type=int, default=50_000)
-    p_apply.add_argument("--tir-bracket-slop-frac", type=float, default=0.10, help="Extra review-boundary bracket slop as interval fraction [default: 0.10]")
-    p_apply.add_argument("--tir-bracket-fraction", type=float, default=1.0, help="Fraction of hallmark intervals that must be bracketed by TIR [default: 1.0]")
-    p_apply.add_argument("--tir-min-dinuc-entropy", type=float, default=2.0, help="Minimum dinucleotide entropy for each TIR arm [default: 2.0]")
-    p_apply.add_argument("--tir-max-kmer-fraction", type=float, default=0.70, help="Maximum dominant k-mer fraction for each TIR arm [default: 0.70]")
-    p_apply.add_argument("--tir-max-tandem-fraction", type=float, default=0.70, help="Maximum tandem-period match fraction for each TIR arm [default: 0.70]")
-    p_apply.add_argument("--tir-tandem-max-period", type=int, default=12, help="Maximum tandem period tested during low-complexity filtering [default: 12]")
-    p_apply.add_argument("--tsd-min-len", type=int, default=4)
-    p_apply.add_argument("--tsd-max-len", type=int, default=12)
-    p_apply.add_argument("--tsd-max-slide", type=int, default=2)
-    p_apply.add_argument("--tsd-flank", type=int, default=60)
-    p_apply.add_argument("--blastn-word-size", type=int, default=7)
-    p_apply.add_argument("--blastn-reward", type=int, default=1)
-    p_apply.add_argument("--blastn-penalty", type=int, default=-1)
-    p_apply.add_argument("--blastn-gapopen", type=int, default=2)
-    p_apply.add_argument("--blastn-gapextend", type=int, default=1)
-    p_apply.add_argument("--blastn-evalue", type=float, default=10.0)
-    p_apply.add_argument("--blastn-max-targets", type=int, default=10000)
-    return parser
+def _program_name() -> str:
+    return Path(sys.argv[0]).name or "findGEVE_review_v5.py"
+
+
+def _render_help(text: str) -> str:
+    return text.format(prog=_program_name())
+
+
+class _Parser(argparse.ArgumentParser):
+    def __init__(self, help_text: str, usage_text: str, **kwargs):
+        self._help_text = help_text
+        self._usage_text = usage_text
+        super().__init__(add_help=False, **kwargs)
+        self.add_argument("-h", "--help", action="help", help=argparse.SUPPRESS)
+
+    def format_help(self) -> str:
+        return _render_help(self._help_text)
+
+    def format_usage(self) -> str:
+        return _render_help(self._usage_text)
+
+
+def _command_parser(command: str) -> _Parser:
+    if command == "make-template":
+        parser = _Parser(
+            MAKE_TEMPLATE_HELP_TEXT,
+            "Usage: {prog} make-template <prefix.summary.tsv> [OPTIONS]\n",
+            prog=f"{_program_name()} make-template",
+        )
+        parser.add_argument("summary", type=Path)
+        parser.add_argument("--overwrite", action="store_true")
+        return parser
+
+    if command == "apply":
+        parser = _Parser(
+            APPLY_HELP_TEXT,
+            f"Usage: {_program_name()} apply -db <directory> --genome genome.fa "
+            "--review <prefix.review.xlsx> --summary <prefix.summary.tsv> "
+            "--markerout <prefix.markerout> [OPTIONS]\n",
+            prog=f"{_program_name()} apply",
+        )
+        parser.add_argument("--review", required=True, type=Path)
+        parser.add_argument("--summary", required=True, type=Path)
+        parser.add_argument("--markerout", required=True, type=Path)
+        parser.add_argument("--genome", required=True, type=Path)
+        parser.add_argument("-db", "--db", required=True, type=Path)
+        parser.add_argument("-g", "--gff", type=Path)
+        parser.add_argument("-e", "--evalue", type=float, default=1e-5)
+        parser.add_argument("-t", "--threads", type=int, default=4)
+        parser.add_argument("--prefix")
+        parser.add_argument("-o", "--outdir", type=Path)
+        parser.add_argument("--outbase", type=Path)
+        parser.add_argument("--overwrite", action="store_true")
+        parser.add_argument("--no-plot", action="store_true")
+        return parser
+
+    if command == "region":
+        parser = _Parser(
+            REGION_HELP_TEXT,
+            f"Usage: {_program_name()} region -db <directory> --genome genome.fa "
+            "--prefix <prefix> --ctg <contig[,contig...]> "
+            "--start <start[,start...]> --end <end[,end...]> [OPTIONS]\n",
+            prog=f"{_program_name()} region",
+        )
+        parser.add_argument("--genome", required=True, type=Path)
+        parser.add_argument("-db", "--db", required=True, type=Path)
+        parser.add_argument("--prefix", required=True)
+        parser.add_argument("--ctg", required=True, nargs="+")
+        parser.add_argument("--start", required=True, nargs="+")
+        parser.add_argument("--end", required=True, nargs="+")
+        parser.add_argument("-g", "--gff", type=Path)
+        parser.add_argument("-e", "--evalue", type=float, default=1e-5)
+        parser.add_argument("-t", "--threads", type=int, default=4)
+        parser.add_argument("-o", "--outdir", type=Path)
+        parser.add_argument("--outbase", type=Path)
+        parser.add_argument("--overwrite", action="store_true")
+        parser.add_argument("--no-plot", action="store_true")
+        return parser
+
+    raise ValueError(command)
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    values = list(sys.argv[1:] if argv is None else argv)
+    if not values or values[0] in {"-h", "--help"}:
+        sys.stdout.write(_render_help(HELP_TEXT))
+        raise SystemExit(0)
+
+    command = values.pop(0)
+    if command not in {"make-template", "apply", "region"}:
+        sys.stderr.write(f"Error: unknown command: {command}\n\n")
+        sys.stderr.write(_render_help(HELP_TEXT))
+        raise SystemExit(2)
+
+    args = _command_parser(command).parse_args(values)
+    args.command = command
+    return args
+
 
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parse_args(argv)
     if args.command == "make-template":
         setup_logging()
         make_template(args.summary, overwrite=args.overwrite)
         return 0
     if args.command == "apply":
         setup_logging()
+        if args.threads < 1:
+            raise SystemExit("Error: --threads must be at least 1")
+        if args.evalue <= 0:
+            raise SystemExit("Error: --evalue must be greater than 0")
         apply_review(args)
         return 0
-    parser.error("unknown command")
+    if args.command == "region":
+        inspect_region(args)
+        return 0
     return 2
 
 if __name__ == "__main__":
