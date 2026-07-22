@@ -79,6 +79,8 @@ Mandatory:
 
 Optionals:
   -g, --gff            Host eukaryotic annotation in GFF/GFF3 format
+  --original-pep       Original findGEVE <prefix>.geve.pep; auto-detected
+                       beside --summary when omitted
   --prefix             Output prefix inferred from --summary when omitted
   -o, --outdir         Output directory
   --outbase            Base directory for an automatic Review_<YYYYMMDD> folder
@@ -1207,43 +1209,103 @@ def _merge_host_intervals(intervals: List[Tuple[int, int]]) -> List[Tuple[int, i
     return merged
 
 def parse_host_gff(path: Optional[Path]) -> Dict[str, List[Tuple[int, int]]]:
+    """Parse the host annotation exactly as findGEVE does."""
     if path is None:
         return {}
     if not path.is_file():
         raise SystemExit(f"Error: GFF file not found: {path}")
-    gene_like = {"gene","mrna","transcript","primary_transcript","lncrna","ncrna","rrna","trna","snorna","snrna","mirna","pseudogene","pseudogenic_transcript"}
-    parts = {"cds","exon"}
-    ignored = {"intron","start_codon","stop_codon","five_prime_utr","three_prime_utr","5utr","3utr","utr"}
+
+    gene_like = {
+        "gene", "mrna", "transcript", "primary_transcript",
+        "lncrna", "ncrna", "rrna", "trna", "snorna", "snrna", "mirna",
+        "pseudogene", "pseudogenic_transcript",
+    }
+    parts = {"cds", "exon"}
+    ignored = {
+        "intron", "start_codon", "stop_codon", "five_prime_utr",
+        "three_prime_utr", "5utr", "3utr", "utr",
+    }
     by_contig = defaultdict(list)
     by_parent = defaultdict(list)
+    n_rows = n_used = n_gene_like = n_part = 0
+
     opener = gzip.open if str(path).endswith(".gz") else open
     with opener(path, "rt", encoding="utf-8", errors="replace") as fh:
         for raw in fh:
-            if not raw.strip() or raw.startswith("#"):
+            line = raw.strip()
+            if not line or line.startswith("#"):
                 continue
-            c = raw.rstrip("\n").split("\t")
+            c = line.split("\t")
             if len(c) < 5:
                 continue
+            n_rows += 1
+            contig = c[0]
+            feature = c[2].strip().lower() if len(c) > 2 else ""
             try:
-                s, e = sorted((int(c[3]), int(c[4])))
-            except ValueError:
+                start = int(c[3])
+                end = int(c[4])
+            except (TypeError, ValueError):
                 continue
-            feature = c[2].lower()
+            if start <= 0 or end <= 0:
+                continue
+            start, end = min(start, end), max(start, end)
+
             if feature in ignored:
                 continue
-            attrs = _parse_attrs(c[8] if len(c) > 8 else "")
-            if feature in gene_like or any(x in feature for x in ("gene","transcript","mrna")):
-                by_contig[c[0]].append((s,e))
-            elif feature in parts or any(x in feature for x in ("cds","exon")):
-                by_contig[c[0]].append((s,e))
-                parent = attrs.get("Parent") or attrs.get("parent") or attrs.get("transcript_id") or attrs.get("gene_id") or attrs.get("ID")
-                if parent:
-                    for p in parent.split(","):
-                        by_parent[(c[0], p.strip())].append((s,e))
-    for (contig, _), spans in by_parent.items():
-        by_contig[contig].append((min(x[0] for x in spans), max(x[1] for x in spans)))
-    out = {c:_merge_host_intervals(v) for c,v in by_contig.items() if v}
-    _LOG.info(f"Host GFF mask: {sum(len(v) for v in out.values()):,} merged interval(s) on {len(out):,} contig(s)")
+            attrs = _parse_attrs(c[8] if len(c) >= 9 else "")
+
+            if feature in gene_like:
+                by_contig[contig].append((start, end))
+                n_used += 1
+                n_gene_like += 1
+                continue
+
+            if feature in parts:
+                by_contig[contig].append((start, end))
+                n_used += 1
+                n_part += 1
+                parent_text = attrs.get("Parent") or attrs.get("parent")
+                if parent_text:
+                    parents = [x.strip() for x in parent_text.split(",") if x.strip()]
+                else:
+                    fallback = (
+                        attrs.get("transcript_id") or attrs.get("gene_id")
+                        or attrs.get("ID") or attrs.get("Name")
+                    )
+                    parents = [fallback] if fallback else []
+                for parent in parents:
+                    by_parent[(contig, parent)].append((start, end))
+                continue
+
+            if any(tok in feature for tok in ("gene", "transcript", "mrna")):
+                by_contig[contig].append((start, end))
+                n_used += 1
+                n_gene_like += 1
+            elif any(tok == feature or tok in feature for tok in ("cds", "exon")):
+                by_contig[contig].append((start, end))
+                n_used += 1
+                n_part += 1
+
+    for (contig, _parent), spans in by_parent.items():
+        if spans:
+            by_contig[contig].append((
+                min(start for start, _ in spans),
+                max(end for _, end in spans),
+            ))
+
+    out = {contig: _merge_host_intervals(v) for contig, v in by_contig.items() if v}
+    n_intervals = sum(len(v) for v in out.values())
+    _LOG.info(
+        f"Host GFF mask: parsed {n_rows:,} feature row(s) from {path}; "
+        f"used {n_used:,} row(s) ({n_gene_like:,} gene/transcript-like, "
+        f"{n_part:,} CDS/exon); collapsed to {n_intervals:,} interval(s) "
+        f"on {len(out):,} contig(s)"
+    )
+    if n_intervals == 0:
+        _LOG.warning(
+            "Host GFF mask: no usable gene/mRNA/transcript/CDS/exon intervals "
+            "were parsed; no ORFs will be removed by --gff"
+        )
     return out
 
 def _contained(intervals: List[Tuple[int,int]], start: int, end: int) -> bool:
@@ -1255,27 +1317,58 @@ def _contained(intervals: List[Tuple[int,int]], start: int, end: int) -> bool:
     i = lo - 1
     return i >= 0 and intervals[i][0] <= start and intervals[i][1] >= end
 
-def predict_review_orfs(record: dict, seqs: Dict[str,str], host: Dict[str,List[Tuple[int,int]]]) -> List[ReviewOrf]:
-    seq = fetch_seq(seqs, record["contig"], record["geve_start"], record["geve_end"])
+def predict_contig_orfs(
+    contig: str,
+    contig_seq: str,
+    host: Dict[str, List[Tuple[int, int]]],
+) -> List[ReviewOrf]:
+    """Run Pyrodigal-GV on the complete contig, matching findGEVE stage 1.
+
+    Predicting independently on a cropped GEVE interval changes the sequence
+    context at both ends and can split, merge, or remove ORFs. Whole-contig
+    prediction makes boundary extension monotonic with respect to the fixed
+    contig ORF catalogue: a larger interval can only retain the same or more
+    fully contained ORFs.
+    """
     try:
-        genes = pyrodigal_gv.ViralGeneFinder(meta=True).find_genes(seq.encode("ascii"))
+        genes = pyrodigal_gv.ViralGeneFinder(meta=True).find_genes(
+            contig_seq.encode("ascii")
+        )
     except Exception as exc:
-        raise SystemExit(f"Error: pyrodigal-gv failed for {record['contig']}:{record['geve_start']}-{record['geve_end']}: {exc}") from exc
-    out = []
+        raise SystemExit(
+            f"Error: pyrodigal-gv failed on complete contig {contig}: {exc}"
+        ) from exc
+
+    out: List[ReviewOrf] = []
     masked = 0
     predicted = 0
     for i, gene in enumerate(genes, 1):
         predicted += 1
-        start = record["geve_start"] + int(gene.begin) - 1
-        end = record["geve_start"] + int(gene.end) - 1
-        if _contained(host.get(record["contig"], []), start, end):
+        start = int(gene.begin)
+        end = int(gene.end)
+        if _contained(host.get(contig, []), start, end):
             masked += 1
             continue
         protein = gene.translate().rstrip("*")
-        if protein:
-            out.append(ReviewOrf(f"{record['reviewed_geve_name']}__orf{i:05d}", record["contig"], start, end, int(gene.strand), protein))
-    _LOG.info(f"Pyrodigal-GV: predicted {predicted:,} ORF(s), removed {masked:,} by host GFF, retained {len(out):,}")
+        if not protein:
+            continue
+        out.append(ReviewOrf(
+            f"{contig}__orf{i:05d}", contig, start, end,
+            int(gene.strand), protein,
+        ))
+
+    _LOG.info(
+        f"Pyrodigal-GV whole-contig prediction | {contig}: "
+        f"predicted={predicted:,}, host-masked={masked:,}, retained={len(out):,}"
+    )
     return out
+
+
+def select_orfs_in_record(record: dict, contig_orfs: List[ReviewOrf]) -> List[ReviewOrf]:
+    """Use the same fully-contained ORF rule as findGEVE."""
+    start = int(record["geve_start"])
+    end = int(record["geve_end"])
+    return [o for o in contig_orfs if o.start >= start and o.end <= end]
 
 def _digital(orfs: List[ReviewOrf]):
     aa = pyhmmer.easel.Alphabet.amino()
@@ -1287,6 +1380,7 @@ def _hmm_name(hits) -> str:
     return x.decode() if isinstance(x, bytes) else str(x)
 
 def scan_changed_orfs(orfs: List[ReviewOrf], db: Path, evalue: float, threads: int) -> None:
+    """Annotate whole-contig ORFs using the same scan scope as findGEVE."""
     if not orfs:
         return
     hallmark_db = db / "NCLDV_markers.hmm"
@@ -1295,55 +1389,113 @@ def scan_changed_orfs(orfs: List[ReviewOrf], db: Path, evalue: float, threads: i
     for req in (hallmark_db, gvog_db):
         if not req.is_file():
             raise SystemExit(f"Error: required database file not found: {req}")
-    by_id = {o.orf_id:o for o in orfs}
-    seqs = _digital(orfs)
-    if not seqs:
-        _LOG.warning("No changed ORFs were eligible for HMM scanning")
+
+    by_id = {o.orf_id: o for o in orfs}
+    hallmark_seqs = _digital(orfs)
+    if not hallmark_seqs:
+        _LOG.warning("No reviewed ORFs were eligible for HMM scanning")
         return
+
+    hallmark_positive_contigs = set()
     with pyhmmer.plan7.HMMFile(str(hallmark_db)) as hf:
         hmms = list(hf)
-    for hits in pyhmmer.hmmsearch(hmms, seqs, cpus=max(1, threads), E=evalue):
+    for hits in pyhmmer.hmmsearch(
+        hmms, hallmark_seqs, cpus=max(1, threads), E=evalue
+    ):
         name = _canon_hallmark(_hmm_name(hits))
         cutoff = _HALLMARK_SCORE_CUTOFFS.get(name, 0.0)
         for hit in hits:
-            if not hit.included or float(hit.score) < cutoff: continue
+            if not hit.included or float(hit.score) < cutoff:
+                continue
             target = hit.name.decode() if isinstance(hit.name, bytes) else str(hit.name)
             o = by_id.get(target)
-            if o and float(hit.score) > o.hallmark_bitscore:
-                o.hallmark, o.hallmark_bitscore, o.hallmark_evalue = name, float(hit.score), float(hit.evalue)
-                o.virbit = max(o.virbit, float(hit.score))
-    with pyhmmer.plan7.HMMFile(str(gvog_db)) as hf:
-        for hits in pyhmmer.hmmsearch(hf, seqs, cpus=max(1, threads), E=evalue):
-            name = _hmm_name(hits)
-            for hit in hits:
-                if not hit.included: continue
-                target = hit.name.decode() if isinstance(hit.name, bytes) else str(hit.name)
-                o = by_id.get(target)
-                if o and float(hit.score) > o.gvog_bitscore:
-                    o.gvog, o.gvog_bitscore, o.gvog_evalue = name, float(hit.score), float(hit.evalue)
-                    o.virbit = max(o.virbit, float(hit.score))
-    if pfam_db.is_file():
-        with pyhmmer.plan7.HMMFile(str(pfam_db)) as hf:
-            for hits in pyhmmer.hmmsearch(hf, seqs, cpus=max(1, threads), E=evalue):
-                name = _hmm_name(hits)
-                try:
-                    raw = hits.query.accession
-                    acc = (raw.decode() if isinstance(raw, bytes) else raw) or name
-                    acc = acc.split(".")[0]
-                except AttributeError:
-                    acc = name
-                for hit in hits:
-                    if not hit.included: continue
-                    target = hit.name.decode() if isinstance(hit.name, bytes) else str(hit.name)
-                    o = by_id.get(target)
-                    if o and float(hit.score) > o.best_pfam_bitscore:
-                        o.best_pfam_acc, o.best_pfam_name = acc, name
-                        o.best_pfam_bitscore, o.best_pfam_evalue = float(hit.score), float(hit.evalue)
-                        o.pfambit = float(hit.score)
-    for o in orfs:
-        o.net_score = o.virbit - o.pfambit
+            if o is None:
+                continue
+            score = float(hit.score)
+            if score > o.hallmark_bitscore:
+                o.hallmark = name
+                o.hallmark_bitscore = score
+                o.hallmark_evalue = float(hit.evalue)
+            if score > o.virbit:
+                o.virbit = score
+            hallmark_positive_contigs.add(o.contig)
 
-def original_orfs(record: dict, marker: pd.DataFrame, seqs: Dict[str,str]) -> List[ReviewOrf]:
+    # findGEVE scans GVOG/Pfam only on hallmark-positive contigs.
+    downstream_orfs = [o for o in orfs if o.contig in hallmark_positive_contigs]
+    downstream_seqs = _digital(downstream_orfs)
+    downstream_by_id = {o.orf_id: o for o in downstream_orfs}
+
+    if downstream_seqs:
+        with pyhmmer.plan7.HMMFile(str(gvog_db)) as hf:
+            for hits in pyhmmer.hmmsearch(
+                hf, downstream_seqs, cpus=max(1, threads), E=evalue
+            ):
+                name = _hmm_name(hits)
+                for hit in hits:
+                    if not hit.included:
+                        continue
+                    target = hit.name.decode() if isinstance(hit.name, bytes) else str(hit.name)
+                    o = downstream_by_id.get(target)
+                    if o is None:
+                        continue
+                    score = float(hit.score)
+                    if score > o.gvog_bitscore:
+                        o.gvog = name
+                        o.gvog_bitscore = score
+                        o.gvog_evalue = float(hit.evalue)
+                    if score > o.virbit:
+                        o.virbit = score
+
+        if pfam_db.is_file():
+            with pyhmmer.plan7.HMMFile(str(pfam_db)) as hf:
+                for hits in pyhmmer.hmmsearch(
+                    hf, downstream_seqs, cpus=max(1, threads), E=evalue
+                ):
+                    name = _hmm_name(hits)
+                    try:
+                        raw = hits.query.accession
+                        acc = (raw.decode() if isinstance(raw, bytes) else raw) or name
+                        acc = acc.split(".")[0]
+                    except AttributeError:
+                        acc = name
+                    for hit in hits:
+                        if not hit.included:
+                            continue
+                        target = hit.name.decode() if isinstance(hit.name, bytes) else str(hit.name)
+                        o = downstream_by_id.get(target)
+                        if o is None:
+                            continue
+                        score = float(hit.score)
+                        if score > o.best_pfam_bitscore:
+                            o.best_pfam_acc = acc
+                            o.best_pfam_name = name
+                            o.best_pfam_bitscore = score
+                            o.best_pfam_evalue = float(hit.evalue)
+                            o.pfambit = score
+
+    for o in orfs:
+        o.net_score = o.virbit - max(0.0, o.pfambit - o.virbit)
+
+def read_peptide_fasta(path: Optional[Path]) -> Dict[str, str]:
+    if path is None or not path.is_file():
+        return {}
+    peptides: Dict[str, List[str]] = {}
+    current: Optional[str] = None
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line:
+                continue
+            if line.startswith(">"):
+                current = line[1:].split()[0]
+                peptides[current] = []
+            elif current is not None:
+                peptides[current].append(line)
+    return {key: "".join(parts) for key, parts in peptides.items()}
+
+
+def original_orfs(record: dict, marker: pd.DataFrame, seqs: Dict[str,str], original_peptides: Optional[Dict[str, str]] = None) -> List[ReviewOrf]:
+    original_peptides = original_peptides or {}
     q = marker[(marker["geve_name"].astype(str) == record["original_geve_name"]) & (~marker["feature"].astype(str).isin(FEATURE_IGNORE))].copy()
     out = []
     q["_s"] = q["start"].map(_safe_int); q["_e"] = q["end"].map(_safe_int)
@@ -1354,13 +1506,15 @@ def original_orfs(record: dict, marker: pd.DataFrame, seqs: Dict[str,str]) -> Li
         strand = -1 if str(row.get("strand","+")) == "-" else 1
         cds = fetch_seq(seqs, record["contig"], s, e)
         if strand < 0: cds = revcomp(cds)
-        o = ReviewOrf(f"{record['reviewed_geve_name']}__orf{i:05d}", record["contig"], s,e,strand,translate_cds(cds))
+        original_id = f"{record['original_geve_name']}_orf{i:05d}"
+        protein = original_peptides.get(original_id, translate_cds(cds))
+        o = ReviewOrf(f"{record['reviewed_geve_name']}__orf{i:05d}", record["contig"], s,e,strand,protein)
         feature, name = str(row.get("feature","")), str(row.get("name","") or "")
         score, ev = _safe_float(row.get("score"),0.0), _safe_float(row.get("e_value"),float("inf"))
         if feature == "hallmark": o.hallmark, o.hallmark_bitscore, o.hallmark_evalue = _canon_hallmark(name), score, ev; o.virbit=score
         elif feature == "gvog": o.gvog, o.gvog_bitscore, o.gvog_evalue = name, score, ev; o.virbit=score
         elif feature == "pfam": o.best_pfam_name, o.best_pfam_acc, o.best_pfam_bitscore, o.best_pfam_evalue = name,name,score,ev; o.pfambit=score
-        o.net_score = o.virbit - o.pfambit
+        o.net_score = o.virbit - max(0.0, o.pfambit - o.virbit)
         out.append(o)
     return out
 
@@ -1370,34 +1524,111 @@ def _valid_original_tir(marker: pd.DataFrame, old: str, start: int, end: int):
         return tir, tsd
     return None, None
 
-def build_v2_records(review: pd.DataFrame, summary: pd.DataFrame, marker: pd.DataFrame, seqs: Dict[str,str], host, db: Path, evalue: float, threads: int, prefix: str):
-    smap = {str(r["geve_name"]):r for _,r in summary.iterrows()}
+def build_v2_records(
+    review: pd.DataFrame,
+    summary: pd.DataFrame,
+    marker: pd.DataFrame,
+    seqs: Dict[str, str],
+    host: Dict[str, List[Tuple[int, int]]],
+    db: Path,
+    evalue: float,
+    threads: int,
+    prefix: str,
+    original_peptides: Optional[Dict[str, str]] = None,
+):
+    smap = {str(r["geve_name"]): r for _, r in summary.iterrows()}
     temp = []
     for _, row in review[review["action"] != "remove"].iterrows():
         start = int(row["review_start"] if row["action"] == "change" else row["original_start"])
         end = int(row["review_end"] if row["action"] == "change" else row["original_end"])
         contig = str(row["contig"])
-        if contig not in seqs: raise SystemExit(f"Error: contig not found in genome: {contig}")
+        if contig not in seqs:
+            raise SystemExit(f"Error: contig not found in genome: {contig}")
         if start < 1 or end > len(seqs[contig]) or start >= end:
-            raise SystemExit(f"Error: invalid reviewed coordinates for {row['geve_name']}: {contig}:{start}-{end} (contig length {len(seqs[contig])})")
-        temp.append(dict(original_geve_name=row["geve_name"], action=row["action"], contig=contig, geve_start=start, geve_end=end, geve_length=end-start+1, original_summary=smap[row["geve_name"]].to_dict()))
-    temp.sort(key=lambda r: (_natural_key(r["contig"]), r["geve_start"], r["geve_end"], _natural_key(r["original_geve_name"])))
-    all_changed = []
-    for i, r in enumerate(temp,1):
-        r["reviewed_geve_name"] = f"{prefix}_GEVE_{i:03d}"
-        r["geve_id"] = r["reviewed_geve_name"]
-        r["gc_geve"] = gc_of_seq(fetch_seq(seqs,r["contig"],r["geve_start"],r["geve_end"]))
-        r["tir"], r["tsd"] = _valid_original_tir(marker,r["original_geve_name"],r["geve_start"],r["geve_end"])
-        r["has_tir"] = r["tir"] is not None
-        if r["action"] == "change":
-            r["orfs"] = predict_review_orfs(r, seqs, host); all_changed.extend(r["orfs"])
+            raise SystemExit(
+                f"Error: invalid reviewed coordinates for {row['geve_name']}: "
+                f"{contig}:{start}-{end} (contig length {len(seqs[contig])})"
+            )
+        temp.append(dict(
+            original_geve_name=row["geve_name"],
+            action=row["action"],
+            contig=contig,
+            geve_start=start,
+            geve_end=end,
+            geve_length=end - start + 1,
+            original_summary=smap[row["geve_name"]].to_dict(),
+        ))
+
+    temp.sort(key=lambda r: (
+        _natural_key(r["contig"]), r["geve_start"], r["geve_end"],
+        _natural_key(r["original_geve_name"]),
+    ))
+    for i, record in enumerate(temp, 1):
+        record["reviewed_geve_name"] = f"{prefix}_GEVE_{i:03d}"
+        record["geve_id"] = record["reviewed_geve_name"]
+        record["gc_geve"] = gc_of_seq(fetch_seq(
+            seqs, record["contig"], record["geve_start"], record["geve_end"]
+        ))
+        record["tir"], record["tsd"] = _valid_original_tir(
+            marker, record["original_geve_name"],
+            record["geve_start"], record["geve_end"],
+        )
+        record["has_tir"] = record["tir"] is not None
+
+    # Re-predict only contigs containing changed GEVEs, but always on the
+    # complete contig. This is the same ORF-context methodology as findGEVE.
+    changed_contigs = sorted(
+        {r["contig"] for r in temp if r["action"] == "change"},
+        key=_natural_key,
+    )
+    contig_orf_catalogue: Dict[str, List[ReviewOrf]] = {}
+    for contig in changed_contigs:
+        contig_orf_catalogue[contig] = predict_contig_orfs(
+            contig, seqs[contig], host
+        )
+
+    all_changed_contig_orfs = [
+        orf
+        for contig in changed_contigs
+        for orf in contig_orf_catalogue.get(contig, [])
+    ]
+    scan_changed_orfs(all_changed_contig_orfs, db, evalue, threads)
+
+    for record in temp:
+        old_orfs = original_orfs(
+            record, marker, seqs, original_peptides=original_peptides
+        )
+        if record["action"] == "change":
+            record["orfs"] = select_orfs_in_record(
+                record, contig_orf_catalogue.get(record["contig"], [])
+            )
+            delta = len(record["orfs"]) - len(old_orfs)
+            _LOG.info(
+                f"ORF comparison | {record['original_geve_name']}: "
+                f"original={len(old_orfs):,}, reviewed={len(record['orfs']):,}, "
+                f"delta={delta:+,}; method=whole_contig_pyrodigal_gv"
+            )
+            if (
+                record["geve_start"] <= (_safe_int(record["original_summary"].get("start"), record["geve_start"]) or record["geve_start"])
+                and record["geve_end"] >= (_safe_int(record["original_summary"].get("end"), record["geve_end"]) or record["geve_end"])
+                and delta < 0
+            ):
+                _LOG.warning(
+                    f"{record['original_geve_name']}: extended boundaries still yielded "
+                    f"fewer ORFs. This indicates a changed Pyrodigal-GV version, genome, "
+                    f"or host-GFF input relative to the original findGEVE run."
+                )
         else:
-            r["orfs"] = original_orfs(r, marker, seqs)
-    scan_changed_orfs(all_changed, db, evalue, threads)
-    for r in temp:
-        r["orfs"].sort(key=lambda o:(o.start,o.end,o.strand))
-        hs = sorted({o.hallmark for o in r["orfs"] if o.hallmark}, key=_hallmark_key)
-        r["hallmarks_present"], r["n_hallmarks"] = hs, sum(1 for o in r["orfs"] if o.hallmark)
+            record["orfs"] = old_orfs
+
+    for record in temp:
+        record["orfs"].sort(key=lambda o: (o.start, o.end, o.strand))
+        hallmarks = sorted(
+            {o.hallmark for o in record["orfs"] if o.hallmark},
+            key=_hallmark_key,
+        )
+        record["hallmarks_present"] = hallmarks
+        record["n_hallmarks"] = sum(1 for o in record["orfs"] if o.hallmark)
     return temp
 
 def coding_density_v2(orfs, start, end):
@@ -1561,8 +1792,30 @@ def apply_review(args) -> None:
     if args.genome is None: raise SystemExit("Error: --genome is required for review reannotation")
     validate_database(args.db)
     _require_columns(marker, ["contig", "geve_name", "feature", "name", "start", "end", "strand", "e_value", "score"], "markerout")
-    seqs=read_fasta(args.genome); host=parse_host_gff(args.gff)
-    records=build_v2_records(review,summary,marker,seqs,host,args.db,args.evalue,args.threads,prefix)
+    seqs = read_fasta(args.genome)
+    host = parse_host_gff(args.gff)
+    original_pep_path = args.original_pep
+    if original_pep_path is not None and not original_pep_path.is_file():
+        raise SystemExit(f"Error: original peptide FASTA not found: {original_pep_path}")
+    if original_pep_path is None:
+        inferred = args.summary.parent / f"{infer_prefix(args.summary, summary)}.geve.pep"
+        if inferred.is_file():
+            original_pep_path = inferred
+    original_peptides = read_peptide_fasta(original_pep_path)
+    if original_peptides:
+        _LOG.info(
+            f"Loaded {len(original_peptides):,} original peptide(s) from "
+            f"{original_pep_path}; unchanged GEVEs will preserve exact peptide sequences"
+        )
+    else:
+        _LOG.warning(
+            "Original GEVE peptide FASTA was not found; unchanged peptides will be "
+            "reconstructed from genomic coordinates and may differ at alternative starts"
+        )
+    records = build_v2_records(
+        review, summary, marker, seqs, host, args.db, args.evalue,
+        args.threads, prefix, original_peptides=original_peptides,
+    )
     file_prefix=f"{prefix}.reviewed"; sp,mp,bp=write_v2_outputs(records,seqs,outdir,file_prefix,args.db)
     if not args.no_plot: run_geve_plot(mp,bp,outdir)
     _LOG.info(f"Retained {len(records):,} GEVE(s); removed {int((review['action']=='remove').sum()):,}; reannotated {int((review['action']=='change').sum()):,}")
@@ -1633,8 +1886,17 @@ def inspect_region(args) -> None:
         _LOG.info(f"Candidate {index:03d} | {contig}:{start}-{end}")
 
     host = parse_host_gff(args.gff)
+    contig_catalogue = {
+        contig: predict_contig_orfs(contig, seqs[contig], host)
+        for contig in sorted(set(contigs), key=_natural_key)
+    }
+    all_orfs = [
+        orf for contig in sorted(contig_catalogue, key=_natural_key)
+        for orf in contig_catalogue[contig]
+    ]
+    scan_changed_orfs(all_orfs, args.db, args.evalue, args.threads)
+
     records = []
-    all_orfs = []
     for index, (contig, start, end) in enumerate(regions, 1):
         geve_id = f"{prefix}_GEVE_{index:03d}"
         record = dict(
@@ -1651,11 +1913,8 @@ def inspect_region(args) -> None:
             has_tir=False,
         )
         record["gc_geve"] = gc_of_seq(fetch_seq(seqs, contig, start, end))
-        record["orfs"] = predict_review_orfs(record, seqs, host)
-        all_orfs.extend(record["orfs"])
+        record["orfs"] = select_orfs_in_record(record, contig_catalogue[contig])
         records.append(record)
-
-    scan_changed_orfs(all_orfs, args.db, args.evalue, args.threads)
     for record in records:
         record["orfs"].sort(key=lambda o: (o.start, o.end, o.strand))
         record["hallmarks_present"] = sorted(
@@ -1681,7 +1940,7 @@ def inspect_region(args) -> None:
 
 
 def _program_name() -> str:
-    return Path(sys.argv[0]).name or "findGEVE_review_v5.py"
+    return Path(sys.argv[0]).name or "findGEVE_review.py"
 
 
 def _render_help(text: str) -> str:
@@ -1727,6 +1986,7 @@ def _command_parser(command: str) -> _Parser:
         parser.add_argument("--genome", required=True, type=Path)
         parser.add_argument("-db", "--db", required=True, type=Path)
         parser.add_argument("-g", "--gff", type=Path)
+        parser.add_argument("--original-pep", type=Path)
         parser.add_argument("-e", "--evalue", type=float, default=1e-5)
         parser.add_argument("-t", "--threads", type=int, default=4)
         parser.add_argument("--prefix")
