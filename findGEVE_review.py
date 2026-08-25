@@ -489,62 +489,63 @@ def validate_review(review: pd.DataFrame, summary: pd.DataFrame) -> Tuple[pd.Dat
             )
             continue
 
-        original = known[geve_name]
-        expected_contig = str(original.get(contig_col, "")).strip()
+        expected_contig = str(known[geve_name].get(contig_col, "")).strip()
         contig = str(row.get("contig", "")).strip()
-        if contig and contig != expected_contig:
+        if not contig:
+            errors.append(f"row {excel_row} ({geve_name}): contig is empty in review.xlsx")
+            continue
+        if contig != expected_contig:
             errors.append(
                 f"row {excel_row} ({geve_name}): contig {contig!r} does not match summary {expected_contig!r}"
             )
 
-        orig_start = _safe_int(original.get("start"))
-        orig_end = _safe_int(original.get("end"))
+        orig_start = _safe_int(row.get("original_start"))
+        orig_end = _safe_int(row.get("original_end"))
         if orig_start is None or orig_end is None:
-            errors.append(f"row {excel_row} ({geve_name}): original summary start/end is not numeric")
+            errors.append(f"row {excel_row} ({geve_name}): original_start/original_end must be numeric in review.xlsx")
             continue
-
-        sheet_orig_start = _safe_int(row.get("original_start"))
-        sheet_orig_end = _safe_int(row.get("original_end"))
-        if sheet_orig_start is not None and sheet_orig_start != orig_start:
-            warnings.append(f"row {excel_row} ({geve_name}): original_start differs from summary; summary value was used")
-        if sheet_orig_end is not None and sheet_orig_end != orig_end:
-            warnings.append(f"row {excel_row} ({geve_name}): original_end differs from summary; summary value was used")
+        if orig_start >= orig_end:
+            errors.append(f"row {excel_row} ({geve_name}): original_start must be smaller than original_end")
+            continue
 
         review_start = _safe_int(row.get("review_start"))
         review_end = _safe_int(row.get("review_end"))
         has_review_bounds = review_start is not None or review_end is not None
+        summary_start = _safe_int(known[geve_name].get("start"))
+        summary_end = _safe_int(known[geve_name].get("end"))
+        original_bounds_changed = (
+            summary_start is not None and summary_end is not None
+            and (orig_start != summary_start or orig_end != summary_end)
+        )
 
-        if action == "unchanged" and has_review_bounds:
+        if action == "unchanged" and (has_review_bounds or original_bounds_changed):
             action = "change"
             warnings.append(
-                f"row {excel_row} ({geve_name}): review_start/review_end were filled while action was unchanged; "
+                f"row {excel_row} ({geve_name}): reviewed coordinates differ from the original call; "
                 "treated as change"
             )
 
         if action == "change":
-            if review_start is None and review_end is not None:
+            if review_start is None:
                 review_start = orig_start
-                warnings.append(
-                    f"row {excel_row} ({geve_name}): review_start was blank for action=change; "
-                    "used original_start"
-                )
-            if review_end is None and review_start is not None:
+            if review_end is None:
                 review_end = orig_end
-                warnings.append(
-                    f"row {excel_row} ({geve_name}): review_end was blank for action=change; "
-                    "used original_end"
-                )
-            if review_start is None and review_end is None:
-                errors.append(f"row {excel_row} ({geve_name}): change requires review_start and/or review_end")
+            if (
+                not original_bounds_changed
+                and not has_review_bounds
+                and review_start == orig_start
+                and review_end == orig_end
+            ):
+                errors.append(f"row {excel_row} ({geve_name}): change requires a modified coordinate in review.xlsx")
             elif review_start >= review_end:
-                errors.append(f"row {excel_row} ({geve_name}): review_start must be smaller than review_end")
+                errors.append(f"row {excel_row} ({geve_name}): reviewed start must be smaller than reviewed end")
         elif has_review_bounds:
             warnings.append(f"row {excel_row} ({geve_name}): review_start/review_end ignored for action={action}")
 
         clean_rows.append(dict(
             geve_name=geve_name,
             action=action,
-            contig=expected_contig,
+            contig=contig,
             original_start=orig_start,
             original_end=orig_end,
             review_start=review_start,
@@ -553,21 +554,11 @@ def validate_review(review: pd.DataFrame, summary: pd.DataFrame) -> Tuple[pd.Dat
 
     missing = sorted(set(known) - seen, key=_natural_key)
     for geve_name in missing:
-        warnings.append(f"{geve_name}: missing from review.xlsx; treated as unchanged")
-        r = known[geve_name]
-        clean_rows.append(dict(
-            geve_name=geve_name,
-            action="unchanged",
-            contig=str(r.get(contig_col, "")),
-            original_start=_safe_int(r.get("start")),
-            original_end=_safe_int(r.get("end")),
-            review_start=None,
-            review_end=None,
-        ))
+        errors.append(f"{geve_name}: missing from review.xlsx; keep the row and use action=remove to exclude it")
 
     clean = pd.DataFrame(clean_rows)
     if not clean.empty:
-        clean = clean.sort_values("geve_name", key=lambda c: c.map(_natural_key)).reset_index(drop=True)
+        clean = clean.reset_index(drop=True)
     return clean, errors, warnings
 
 def parse_blastn_tabular(tab_path: Path) -> List[TirPair]:
@@ -1559,13 +1550,9 @@ def build_v2_records(
             original_summary=smap[row["geve_name"]].to_dict(),
         ))
 
-    temp.sort(key=lambda r: (
-        _natural_key(r["contig"]), r["geve_start"], r["geve_end"],
-        _natural_key(r["original_geve_name"]),
-    ))
-    for i, record in enumerate(temp, 1):
-        record["reviewed_geve_name"] = f"{prefix}_GEVE_{i:03d}"
-        record["geve_id"] = record["reviewed_geve_name"]
+    for record in temp:
+        record["reviewed_geve_name"] = record["original_geve_name"]
+        record["geve_id"] = record["original_geve_name"]
         record["gc_geve"] = gc_of_seq(fetch_seq(
             seqs, record["contig"], record["geve_start"], record["geve_end"]
         ))
