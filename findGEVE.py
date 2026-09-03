@@ -45,8 +45,8 @@ Optionals:
   -t, --threads        CPU threads for ORF prediction and HMM search [default: 4]
   -p, --parallel       Parallel seed-clustering and TIR workers      [default: --threads]
   -g, --gff            Host eukaryotic gene annotation in GFF/GFF3;
-                       Pyrodigal-GV ORFs fully contained in host
-                       gene/transcript/CDS/exon spans are removed
+                       Pyrodigal-GV ORFs overlapping host gene spans
+                       are removed except for negligible edge overlap
   -e, --evalue         E-value cutoff for HMM searches               [default: 1e-5]
   -m, --min-hallmark   Minimum number of hallmark copies
                        required in the final retained GEVE           [default: 2]
@@ -84,6 +84,8 @@ DEFAULTS = dict(
 
 _HOST_TERRITORY_FRACTION = 0.7
 _GEVE_MERGE_GAP          = 150_000
+_HOST_ORF_EDGE_OVERLAP_BP = 15
+_HOST_ORF_EDGE_OVERLAP_FRACTION = 0.02
 
 # Canonical NCLDV hallmark short names. These names are used exactly as
 # the HMM profile names and are preserved in hallmark output filenames.
@@ -484,50 +486,117 @@ def parse_host_gff_intervals(gff_path: Path) -> Dict[str, List[Tuple[int, int]]]
     return merged_by_contig
 
 
-def _is_fully_contained_in_intervals(
+def _host_overlap_bp(
     contig_intervals: List[Tuple[int, int]],
     start: int,
     end: int,
-) -> bool:
-    """True if [start, end] is fully contained in any merged host interval."""
-    if not contig_intervals:
-        return False
-    # Intervals are merged and sorted. The containing interval, if present,
-    # must be the rightmost interval with start <= ORF start.
+) -> int:
+    if not contig_intervals or end < start:
+        return 0
+
     lo, hi = 0, len(contig_intervals)
     while lo < hi:
         mid = (lo + hi) // 2
-        if contig_intervals[mid][0] <= start:
+        if contig_intervals[mid][1] < start:
             lo = mid + 1
         else:
             hi = mid
-    idx = lo - 1
-    return idx >= 0 and contig_intervals[idx][0] <= start and contig_intervals[idx][1] >= end
+
+    overlap = 0
+    i = lo
+    while i < len(contig_intervals):
+        iv_start, iv_end = contig_intervals[i]
+        if iv_start > end:
+            break
+        overlap += max(0, min(end, iv_end) - max(start, iv_start) + 1)
+        i += 1
+    return overlap
+
+
+def _host_overlap_allowed(
+    orf: Orf,
+    contig_intervals: List[Tuple[int, int]],
+    overlap_bp: int,
+) -> bool:
+    if overlap_bp <= 0:
+        return True
+
+    orf_len = max(1, orf.end - orf.start + 1)
+    tolerance = max(
+        _HOST_ORF_EDGE_OVERLAP_BP,
+        int(np.ceil(orf_len * _HOST_ORF_EDGE_OVERLAP_FRACTION)),
+    )
+    if overlap_bp > tolerance:
+        return False
+
+    overlaps: List[Tuple[int, int]] = []
+    for iv_start, iv_end in contig_intervals:
+        if iv_end < orf.start:
+            continue
+        if iv_start > orf.end:
+            break
+        s = max(orf.start, iv_start)
+        e = min(orf.end, iv_end)
+        if s <= e:
+            overlaps.append((s, e))
+            if len(overlaps) > 1:
+                return False
+
+    if len(overlaps) != 1:
+        return False
+    s, e = overlaps[0]
+    return s == orf.start or e == orf.end
 
 
 def filter_orfs_by_host_gff(
     orfs_by_id: Dict[str, Orf],
     host_intervals_by_contig: Dict[str, List[Tuple[int, int]]],
 ) -> int:
-    """Remove Pyrodigal-GV ORFs fully contained in host eukaryotic annotations."""
+    """Remove Pyrodigal-GV ORFs with non-negligible overlap with host genes."""
     if not host_intervals_by_contig or not orfs_by_id:
         return 0
+
     remove_ids: List[str] = []
+    edge_only = 0
     for orf_id, orf in orfs_by_id.items():
-        if _is_fully_contained_in_intervals(
-            host_intervals_by_contig.get(orf.contig, []), orf.start, orf.end
-        ):
+        contig_intervals = host_intervals_by_contig.get(orf.contig, [])
+        overlap_bp = _host_overlap_bp(contig_intervals, orf.start, orf.end)
+        if overlap_bp <= 0:
+            continue
+        if _host_overlap_allowed(orf, contig_intervals, overlap_bp):
+            edge_only += 1
+        else:
             remove_ids.append(orf_id)
+
     for orf_id in remove_ids:
         del orfs_by_id[orf_id]
+
     _LOG.info(
-        f"Host GFF mask: removed {len(remove_ids):,} Pyrodigal-GV ORF(s) "
-        f"fully contained in host annotation intervals; "
+        f"Host GFF mask: removed {len(remove_ids):,} Pyrodigal-GV ORF(s) with "
+        f"host-gene overlap above the edge tolerance "
+        f"(max {_HOST_ORF_EDGE_OVERLAP_BP} bp or "
+        f"{_HOST_ORF_EDGE_OVERLAP_FRACTION:.0%} of ORF length); "
+        f"retained {edge_only:,} ORF(s) with edge-only overlap; "
         f"{len(orfs_by_id):,} ORF(s) retained for HMM scans"
     )
     if not orfs_by_id:
         _LOG.warning("Host GFF mask removed all predicted ORFs.")
     return len(remove_ids)
+
+
+def _disallowed_host_overlap_orfs(
+    orfs: Iterable[Orf],
+    host_intervals_by_contig: Dict[str, List[Tuple[int, int]]],
+) -> List[Tuple[Orf, int]]:
+    bad: List[Tuple[Orf, int]] = []
+    for orf in orfs:
+        contig_intervals = host_intervals_by_contig.get(orf.contig, [])
+        overlap_bp = _host_overlap_bp(contig_intervals, orf.start, orf.end)
+        if overlap_bp > 0 and not _host_overlap_allowed(
+            orf, contig_intervals, overlap_bp
+        ):
+            bad.append((orf, overlap_bp))
+    return bad
 
 # Stage 2: HMM scans
 _HMMER_MAX_TARGET_LEN = 100_000
@@ -2683,7 +2752,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("-t", "--threads", type=int, default=4)
     p.add_argument("-p", "--parallel", type=int, default=None)
     p.add_argument("-g", "--gff", type=Path, default=None,
-                   help="Optional host eukaryotic gene annotation GFF/GFF3 used to remove fully overlapping Pyrodigal-GV ORFs")
+                   help="Optional host eukaryotic gene annotation GFF/GFF3 used to remove Pyrodigal-GV ORFs with non-negligible host-gene overlap")
     p.add_argument("-e", "--evalue", type=float, default=DEFAULTS["evalue"])
     p.add_argument("-m", "--min-hallmark", dest="min_hallmark", type=int,
                    default=DEFAULTS["min_hallmarks"])
@@ -2809,6 +2878,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Stage 1: ORF prediction
     orfs_by_id, contig_lens = predict_orfs(args.genome, cfg["min_contig"], args.threads)
+    host_intervals_by_contig: Dict[str, List[Tuple[int, int]]] = {}
     if args.gff is not None:
         host_intervals_by_contig = parse_host_gff_intervals(args.gff)
         filter_orfs_by_host_gff(orfs_by_id, host_intervals_by_contig)
@@ -3017,6 +3087,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         _LOG.warning("No GEVE candidates remained after final QC filters.")
         _write_no_geve_notice(args.outdir, args.genome, "No GEVE candidates remained after final QC filters.")
         return 0
+
+    if args.gff is not None:
+        final_orfs = (o for g in raw_geves for o in g["orfs"])
+        bad_overlaps = _disallowed_host_overlap_orfs(final_orfs, host_intervals_by_contig)
+        if bad_overlaps:
+            examples = "; ".join(
+                f"{o.orf_id}:{bp}bp" for o, bp in bad_overlaps[:10]
+            )
+            _LOG.error(
+                f"Host GFF invariant failed: {len(bad_overlaps):,} final GEVE ORF(s) "
+                f"still have host-gene overlap above tolerance. Examples: {examples}"
+            )
+            return 2
+        _LOG.info("Host GFF final check: no disallowed host-gene/GEVE-ORF overlaps remain")
 
     # Sort and assign final IDs by natural contig order, then position
     raw_geves.sort(key=lambda g: (_natural_key(g["contig"]), g["geve_start"]))
