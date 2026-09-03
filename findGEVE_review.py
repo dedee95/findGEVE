@@ -1144,6 +1144,8 @@ import pyrodigal_gv
 _HALLMARK_ORDER = ["A32", "D5", "SFII", "MCP", "mRNAc", "PolB", "RNAPL", "RNAPS", "RNR", "VLTF3"]
 _HALLMARK_CANONICAL = {x.lower(): x for x in _HALLMARK_ORDER}
 _HALLMARK_SCORE_CUTOFFS = {"A32":100.0,"D5":180.0,"SFII":120.0,"MCP":120.0,"mRNAc":180.0,"PolB":300.0,"RNAPL":300.0,"RNAPS":250.0,"RNR":200.0,"VLTF3":100.0}
+_HOST_ORF_EDGE_OVERLAP_BP = 15
+_HOST_ORF_EDGE_OVERLAP_FRACTION = 0.02
 
 @dataclass
 class ReviewOrf:
@@ -1299,14 +1301,65 @@ def parse_host_gff(path: Optional[Path]) -> Dict[str, List[Tuple[int, int]]]:
         )
     return out
 
-def _contained(intervals: List[Tuple[int,int]], start: int, end: int) -> bool:
+def _host_overlap_bp(
+    intervals: List[Tuple[int, int]],
+    start: int,
+    end: int,
+) -> int:
+    if not intervals or end < start:
+        return 0
+
     lo, hi = 0, len(intervals)
     while lo < hi:
-        mid = (lo + hi)//2
-        if intervals[mid][0] <= start: lo = mid + 1
-        else: hi = mid
-    i = lo - 1
-    return i >= 0 and intervals[i][0] <= start and intervals[i][1] >= end
+        mid = (lo + hi) // 2
+        if intervals[mid][1] < start:
+            lo = mid + 1
+        else:
+            hi = mid
+
+    overlap = 0
+    i = lo
+    while i < len(intervals):
+        iv_start, iv_end = intervals[i]
+        if iv_start > end:
+            break
+        overlap += max(0, min(end, iv_end) - max(start, iv_start) + 1)
+        i += 1
+    return overlap
+
+def _host_overlap_allowed(
+    orf: ReviewOrf,
+    intervals: List[Tuple[int, int]],
+    overlap_bp: int,
+) -> bool:
+    if overlap_bp <= 0:
+        return True
+
+    orf_len = max(1, orf.end - orf.start + 1)
+    tolerance = max(
+        _HOST_ORF_EDGE_OVERLAP_BP,
+        int(np.ceil(orf_len * _HOST_ORF_EDGE_OVERLAP_FRACTION)),
+    )
+    if overlap_bp > tolerance:
+        return False
+
+    overlaps: List[Tuple[int, int]] = []
+    for iv_start, iv_end in intervals:
+        if iv_end < orf.start:
+            continue
+        if iv_start > orf.end:
+            break
+        s = max(orf.start, iv_start)
+        e = min(orf.end, iv_end)
+        if s <= e:
+            overlaps.append((s, e))
+            if len(overlaps) > 1:
+                return False
+
+    if len(overlaps) != 1:
+        return False
+    s, e = overlaps[0]
+    return s == orf.start or e == orf.end
 
 def predict_contig_orfs(
     contig: str,
@@ -1332,25 +1385,33 @@ def predict_contig_orfs(
 
     out: List[ReviewOrf] = []
     masked = 0
+    edge_only = 0
     predicted = 0
+    intervals = host.get(contig, [])
     for i, gene in enumerate(genes, 1):
         predicted += 1
         start = int(gene.begin)
         end = int(gene.end)
-        if _contained(host.get(contig, []), start, end):
-            masked += 1
-            continue
         protein = gene.translate().rstrip("*")
         if not protein:
             continue
-        out.append(ReviewOrf(
+        orf = ReviewOrf(
             f"{contig}__orf{i:05d}", contig, start, end,
             int(gene.strand), protein,
-        ))
+        )
+        overlap_bp = _host_overlap_bp(intervals, start, end)
+        if overlap_bp > 0:
+            if _host_overlap_allowed(orf, intervals, overlap_bp):
+                edge_only += 1
+            else:
+                masked += 1
+                continue
+        out.append(orf)
 
     _LOG.info(
         f"Pyrodigal-GV whole-contig prediction | {contig}: "
-        f"predicted={predicted:,}, host-masked={masked:,}, retained={len(out):,}"
+        f"predicted={predicted:,}, host-masked={masked:,}, "
+        f"edge-overlap-retained={edge_only:,}, retained={len(out):,}"
     )
     return out
 
